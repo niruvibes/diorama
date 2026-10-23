@@ -5,12 +5,15 @@ import dev.diorama.Projection;
 import dev.diorama.bake.BlockLooks;
 import dev.diorama.bake.ChunkSource;
 import dev.diorama.bake.Overlays;
+import dev.diorama.bake.MapPick;
 import dev.diorama.bake.TileBaker;
 import dev.diorama.bake.TileImage;
 import dev.diorama.bake.TileKey;
 import dev.diorama.data.ChunkSnapshot;
 import dev.diorama.data.SeenBlocks;
 import dev.diorama.data.TileStore;
+import dev.diorama.data.MapLocations;
+import net.minecraft.core.BlockPos;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -522,6 +525,43 @@ public final class MapLevel implements ChunkSource {
 		return this.store != null;
 	}
 
+	/** Live terrain first, then saved coordinates; old image-only maps still allow approximate pins. */
+	public MapLocations.@Nullable Location pick(BlockLooks looks, double u, double v, int layer, int fallbackY) {
+		BlockPos live = MapPick.standingSpot(this, looks, u, v, layer, this.fogOfWar);
+		if (live != null) {
+			return new MapLocations.Location(live, MapPick.biomeAt(this, live), false);
+		}
+		if (layer != TileKey.SURFACE) {
+			return null;
+		}
+		TileKey key = new TileKey(layer, (int) Math.floor(u / Projection.TILE_UNITS), (int) Math.floor(v / Projection.TILE_UNITS));
+		MapLocations saved = this.store == null ? null : this.store.locations(key);
+		MapLocations.Location location = saved == null ? null : saved.at(u, v);
+		if (location != null) {
+			return location;
+		}
+		// Old .omt files only contain an image. Do not invent its biome or ground height.
+		// Keep waypoint creation available and mark its position as approximate in the UI.
+		if (!this.mapped(u, v, layer)) {
+			return null;
+		}
+		return new MapLocations.Location(BlockPos.containing(u, fallbackY, (v + fallbackY * Projection.cos()) / Projection.sin()), null, true);
+	}
+
+	private boolean mapped(double u, double v, int layer) {
+		for (int lod = 0; lod <= TileKey.MAX_LOD; lod++) {
+			double units = (double) Projection.TILE_UNITS * (1 << lod);
+			int tu = (int) Math.floor(u / units);
+			int tv = (int) Math.floor(v / units);
+			MapTile tile = this.tiles.get(new TileKey(layer, tu, tv, lod));
+			if (tile != null && tile.coverage((int) ((u / units - tu) * Projection.COVERAGE_CELLS),
+				(int) ((v / units - tv) * Projection.COVERAGE_CELLS)) > 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Uploads finished bakes and starts new ones. Call regularly on the render thread. */
 	public void update() {
 		this.frame++;
@@ -587,7 +627,7 @@ public final class MapLevel implements ChunkSource {
 		}
 
 		BlockLooks looks = BlockLooks.get();
-		if (looks != null && this.topY != Integer.MIN_VALUE) {
+		if (looks != null && (this.topY != Integer.MIN_VALUE || this.store != null)) {
 			long now = System.currentTimeMillis();
 			int limit = 6;
 			List<Map.Entry<TileKey, Double>> order = new ArrayList<>(this.wanted.entrySet());
@@ -667,7 +707,11 @@ public final class MapLevel implements ChunkSource {
 		// changes those two.
 		int view = this.roof() != dev.diorama.bake.ChunkSource.NO_ROOF ? dev.diorama.render.gpu.GpuBakeCheck.UNDER_ROOF
 			: key.isCave() ? dev.diorama.render.gpu.GpuBakeCheck.CAVE : dev.diorama.render.gpu.GpuBakeCheck.SKY;
-		dev.diorama.render.gpu.GpuBakeCheck.Mode gpu = dev.diorama.render.gpu.GpuBakeCheck.mode(view, view != dev.diorama.render.gpu.GpuBakeCheck.SKY && fog, overlays != null);
+		// An image-only saved map has no geometry to mesh (or even a valid top height).
+		// The CPU path simply reads its pixels and leaves its missing locations unknown.
+		dev.diorama.render.gpu.GpuBakeCheck.Mode gpu = this.topY == Integer.MIN_VALUE
+			? dev.diorama.render.gpu.GpuBakeCheck.Mode.TRACE
+			: dev.diorama.render.gpu.GpuBakeCheck.mode(view, view != dev.diorama.render.gpu.GpuBakeCheck.SKY && fog, overlays != null);
 		if (gpu == dev.diorama.render.gpu.GpuBakeCheck.Mode.GPU) {
 			this.bakeOnGpu(key, looks, generation, fog, overlays, store);
 			return;
@@ -698,12 +742,14 @@ public final class MapLevel implements ChunkSource {
 		BAKERS.execute(() -> {
 			try {
 				int[] saved = store == null ? null : store.read(key);
-				dev.diorama.bake.GpuMesher.Mesh mesh = dev.diorama.bake.GpuMesher.build(key, this, looks, fog, overlays);
+				dev.diorama.bake.ChunkSource source = fog ? this : new dev.diorama.bake.PinnedSource(this);
+				dev.diorama.bake.GpuMesher.Mesh mesh = dev.diorama.bake.GpuMesher.build(key, source, looks, fog, overlays);
+				MapLocations locations = MapPick.locations(key, source, looks, fog, null);
 				dev.diorama.render.gpu.GpuTileBaker.submit(mesh, result -> BAKERS.execute(() -> {
 					try {
 						TileImage image = result.pixels() == null
-							? TileBaker.bake(key, this, looks, null, fog, saved, overlays)
-							: TileBaker.gpuImage(key, result.pixels(), saved, result.info());
+							? TileBaker.bake(key, source, looks, null, fog, saved, overlays)
+							: TileBaker.gpuImage(key, result.pixels(), saved, result.info()).withLocations(locations);
 						this.finished.add(image.withGeneration(generation));
 					} catch (Throwable t) {
 						Diorama.LOGGER.error("Failed to finish GPU tile {}", key, t);

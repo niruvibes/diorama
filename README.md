@@ -23,6 +23,10 @@ Places the map has no data for sit under animated fog. Underground, the map swit
 
 Saved maps and waypoints live in `.minecraft/diorama/`, one folder per world. On a server, each world behind its address gets its own folder, told apart by the world seed the server sends, so a network's lobby and survival worlds, or a map reset, don't mix.
 
+Realms use their permanent Realm ID and world slot instead of their temporary connection address, so restarting a Realm keeps the same map. Older folders split across Realms addresses are merged automatically on the next visit; their originals are kept in `diorama/legacy-realms/`. Saved overview tiles are repaired automatically when needed, so zooming out keeps previously explored terrain visible.
+
+Map tiles also save terrain coordinates and biome names, so hovering and adding waypoints keep working after chunks unload or the game restarts. Old image-only tiles still allow waypoints, labelled as approximate because their heights weren't saved; visiting those places again fills in their terrain and biome data. Unknown biomes are left unlabelled instead of displaying the client's empty-chunk fallback.
+
 ## Keys
 
 - `M` opens the fullscreen map. Drag to pan, scroll to zoom, right-click to add a waypoint, click a waypoint to edit it.
@@ -53,3 +57,7 @@ Versions named `<minecraft>-neoforge` build for NeoForge; the rest build for Fab
 `./gradlew :1.21.1-neoforge:runClientGameTest` runs the same scenarios on NeoForge, all but the dedicated server one. NeoForge has no client game test API, so they run on `src/gameshim`, the test-only stand-in for Fabric's that the Fabric jars before 1.21.4 use too.
 
 `./gradlew :1.21.11:runProductionClientGameTest` runs the same tests against the remapped release jar in a normal install, with Fabric API as published. In development 1.21.11 uses Mojang's names, but a normal install uses intermediary ones, so anything that looks the game up by name only fails there.
+
+`./gradlew :26.3:runSavedMapChecks` tests saved-map recovery without opening a game window; these checks also run as part of `build`. `DIORAMA_TESTS=storage` runs them in the client too and verifies that a Realm keeps its identity after an address change, while different Realms and world slots remain separate.
+
+`DIORAMA_TESTS=map-picking` checks saved coordinates and biomes with no chunk snapshots, approximate waypoint placement on old image-only maps, and the waypoint menu after travelling 2,000 blocks away from the original terrain.

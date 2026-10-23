@@ -1,9 +1,9 @@
 package dev.diorama;
 
 import dev.diorama.bake.BlockLooks;
-import dev.diorama.bake.MapPick;
 import dev.diorama.bake.Overlays;
 import dev.diorama.bake.TileKey;
+import dev.diorama.data.MapLocations;
 import dev.diorama.render.MapViewport;
 import dev.diorama.render.Markers;
 import dev.diorama.render.Radar;
@@ -106,7 +106,7 @@ public final class MapScreen extends Screen {
 	private int spotV;
 	private int spotLayer;
 	private int spotAge;
-	private @Nullable BlockPos spot;
+	private MapLocations.@Nullable Location spot;
 
 	public MapScreen() {
 		super(Component.translatable("diorama.screen.title"));
@@ -439,7 +439,7 @@ public final class MapScreen extends Screen {
 	}
 
 	/** Where a player would stand on the block shown under a screen point; null where the map has nothing. */
-	private @Nullable BlockPos spotAt(double screenX, double screenY) {
+	private MapLocations.@Nullable Location spotAt(double screenX, double screenY) {
 		MapSession session = MapSession.get();
 		BlockLooks looks = BlockLooks.get();
 		MapViewport.View view = this.lastView;
@@ -448,18 +448,24 @@ public final class MapScreen extends Screen {
 		}
 		double u = view.centerU() + (screenX - view.x() - view.width() / 2.0) / view.zoom();
 		double v = view.centerV() + (screenY - view.y() - view.height() / 2.0) / view.zoom();
-		return MapPick.standingSpot(session.map(), looks, u, v, this.layer, session.map().fogOfWar());
+		int fallbackY = this.minecraft.player == null ? 64 : this.minecraft.player.blockPosition().getY();
+		return session.map().pick(looks, u, v, this.layer, fallbackY);
 	}
 
-	private List<MapMenu.Item> spotItems(@Nullable BlockPos spot) {
-		if (spot == null) {
+	private List<MapMenu.Item> spotItems(MapLocations.@Nullable Location location) {
+		if (location == null) {
 			return List.of(MapMenu.Item.info(Component.translatable("diorama.menu.not_mapped")));
 		}
+		BlockPos spot = location.position();
 		int x = spot.getX();
 		int y = spot.getY();
 		int z = spot.getZ();
-		return List.of(
-			MapMenu.Item.info(this.where(x, y, z)),
+		List<MapMenu.Item> items = new ArrayList<>();
+		items.add(MapMenu.Item.info(this.where(x, y, z)));
+		if (location.approximate()) {
+			items.add(MapMenu.Item.info(Component.translatable("diorama.map.approximate_location")));
+		}
+		items.addAll(List.of(
 			MapMenu.Item.action(Component.translatable("diorama.menu.teleport_here"), Waypoints.canTeleport(), () -> {
 				Waypoints.teleport(x, y, z);
 				this.minecraft.gui.setScreen(null);
@@ -474,13 +480,14 @@ public final class MapScreen extends Screen {
 			// Chat can't take it back, so sharing asks twice.
 			MapMenu.Item.confirmed(Component.translatable("diorama.menu.share_location"), Component.translatable("diorama.menu.share_confirm"), () -> {
 				String dimension = Waypoints.dimension();
-				Waypoint location = new Waypoint(Component.translatable("diorama.menu.shared_location").getString(), x, y, z,
+				Waypoint shared = new Waypoint(Component.translatable("diorama.menu.shared_location").getString(), x, y, z,
 					dimension != null ? dimension : "minecraft:overworld", Waypoint.PALETTE[0]);
-				if (WaypointShare.send(location)) {
+				if (WaypointShare.send(shared)) {
 					this.minecraft.gui.setScreen(null);
 				}
 			})
-		);
+		));
+		return items;
 	}
 
 	private List<MapMenu.Item> waypointItems(Waypoint waypoint) {
@@ -816,27 +823,30 @@ public final class MapScreen extends Screen {
 			this.spotAge = 0;
 			this.spot = this.spotAt(mouseX, mouseY);
 		}
-		BlockPos spot = this.spot;
-		if (spot == null) {
+		MapLocations.Location location = this.spot;
+		if (location == null) {
 			return null;
 		}
+		BlockPos spot = location.position();
 		long distance = Math.round(Math.sqrt(player.distanceToSqr(spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5)));
-		Component biome = this.biomeAt(spot);
+		Component biome = this.biomeAt(location);
 		Component detail = biome != null
 			? Component.translatable("diorama.map.spot_detail", biome, distance)
 			: Component.translatable("diorama.map.distance", distance);
-		return lines(Component.translatable("diorama.map.spot", spot.getX(), spot.getY(), spot.getZ()), detail);
+		List<FormattedCharSequence> lines = new ArrayList<>(lines(Component.translatable("diorama.map.spot", spot.getX(), spot.getY(), spot.getZ()), detail));
+		if (location.approximate()) {
+			lines.add(Component.translatable("diorama.map.approximate_location").withStyle(ChatFormatting.GRAY).getVisualOrderText());
+		}
+		return lines;
 	}
 
-	/** The biome at a spot, where the game has its chunk loaded; null elsewhere. */
-	private @Nullable Component biomeAt(BlockPos pos) {
-		ClientLevel level = this.minecraft.level;
-		if (level == null || !level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)) {
+	/** Only label a biome from captured terrain, never the live client's empty-chunk fallback. */
+	private @Nullable Component biomeAt(MapLocations.Location location) {
+		if (location.biome() == null) {
 			return null;
 		}
-		return level.getBiome(pos).unwrapKey()
-			.map(k -> (Component) Component.translatableWithFallback(k.identifier().toLanguageKey("biome"), k.identifier().getPath()))
-			.orElse(null);
+		Identifier biome = Identifier.tryParse(location.biome());
+		return biome == null ? null : Component.translatableWithFallback(biome.toLanguageKey("biome"), biome.getPath());
 	}
 
 	/** A tooltip: a white first line and a grey second one. */

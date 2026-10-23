@@ -71,6 +71,15 @@ public class DioramaClientTest implements FabricClientGameTest {
 		context.runOnClient(mc -> mc.options.renderDistance().set(12));
 		String seed = System.getProperty("diorama.seed", "diorama");
 		Set<String> tests = selectedTests();
+		context.runOnClient(mc -> dev.diorama.WorldKeyChecks.check());
+		if (tests.contains("storage")) {
+			try {
+				dev.diorama.data.SavedMapChecks.main(new String[0]);
+			} catch (Exception e) {
+				throw new AssertionError("Saved map checks failed", e);
+			}
+			return;
+		}
 		if (tests.contains("showcase") && tests.size() > 1) {
 			// The showcase leaves the player in the Nether, spectating, on peaceful, with radar off.
 			throw new AssertionError("Run the showcase on its own: DIORAMA_TESTS=showcase");
@@ -141,6 +150,9 @@ public class DioramaClientTest implements FabricClientGameTest {
 				brokenFog(context);
 			}
 			*///?}
+			if (tests.contains("map-picking")) {
+				mapPicking(context, world);
+			}
 			if (spawnCell != null) {
 				// Go far from spawn, so its chunks are long gone once the world is reopened.
 				world.getServer().runCommand("tp @a 3000 200 3000");
@@ -3236,6 +3248,128 @@ public class DioramaClientTest implements FabricClientGameTest {
 	}
 
 	/** Which scenarios to run: DIORAMA_TESTS=tour,radar,... (default: all but styles). */
+	/** A saved map must remain interactive after the client has neither live chunks nor snapshots. */
+	private static void mapPicking(ClientGameTestContext context, TestSingleplayerContext world) {
+		record Sample(double u, double v, dev.diorama.data.MapLocations.Location location,
+			dev.diorama.data.MapLocations locations, TileKey key, int minY, int maxY) {
+		}
+		Sample sample = context.computeOnClient(mc -> {
+			MapLevel map = MapSession.get().map();
+			var looks = dev.diorama.bake.BlockLooks.get();
+			double u = Math.floor(mc.player.getX()) + 0.5;
+			double v = Math.floor(Projection.v(mc.player.getY(), mc.player.getZ())) + 0.5;
+			BlockPos pos = dev.diorama.bake.MapPick.standingSpot(map, looks, u, v, TileKey.SURFACE, false);
+			if (pos == null) {
+				throw new AssertionError("No terrain under the test cursor");
+			}
+			String liveBiome = mc.level.getBiome(pos).unwrapKey().orElseThrow().identifier().toString();
+			String capturedBiome = dev.diorama.bake.MapPick.biomeAt(map, pos);
+			if (!liveBiome.equals(capturedBiome)) {
+				throw new AssertionError("Captured biome " + capturedBiome + " differs from loaded biome " + liveBiome);
+			}
+			TileKey key = new TileKey(TileKey.SURFACE, (int) Math.floor(u / Projection.TILE_UNITS), (int) Math.floor(v / Projection.TILE_UNITS));
+			long start = System.nanoTime();
+			var locations = dev.diorama.bake.MapPick.locations(key, map, looks, false, null);
+			dev.diorama.Diorama.LOGGER.info("Captured a tile's terrain locations in {} ms", (System.nanoTime() - start) / 1_000_000);
+			var saved = locations == null ? null : locations.at(u, v);
+			if (saved == null || !pos.equals(saved.position()) || !liveBiome.equals(saved.biome())) {
+				throw new AssertionError("The saved pick differs from the live pick");
+			}
+			return new Sample(u, v, saved, locations, key, map.minY(), map.maxY());
+		});
+		java.nio.file.Path folder;
+		try {
+			folder = java.nio.file.Files.createTempDirectory("diorama-picking-");
+			String storeName = Math.round(MapStyle.get().pitchDegrees()) == 60 ? "surface" : "surface-" + Math.round(MapStyle.get().pitchDegrees());
+			int[] pixels = new int[Projection.TILE_PIXELS * Projection.TILE_PIXELS];
+			java.util.Arrays.fill(pixels, 0xFF709050);
+			var image = dev.diorama.bake.TileBaker.image(sample.key(), pixels);
+			var writer = new dev.diorama.data.TileStore(folder.resolve("saved").resolve(storeName));
+			writer.baked(image.withLocations(sample.locations()));
+			writer.close();
+			writer = new dev.diorama.data.TileStore(folder.resolve("image-only").resolve(storeName));
+			writer.baked(image);
+			writer.close();
+		} catch (java.io.IOException e) {
+			throw new AssertionError(e);
+		}
+		MapLevel restored = context.computeOnClient(mc -> new MapLevel(sample.minY(), sample.maxY(), MapLevel.NO_ROOF, folder.resolve("saved")));
+		MapLevel old = context.computeOnClient(mc -> new MapLevel(sample.minY(), sample.maxY(), MapLevel.NO_ROOF, folder.resolve("image-only")));
+		try {
+			context.waitFor(mc -> {
+				var pick = restored.pick(dev.diorama.bake.BlockLooks.get(), sample.u(), sample.v(), TileKey.SURFACE, 64);
+				return pick != null;
+			}, 200);
+			context.runOnClient(mc -> {
+				var pick = restored.pick(dev.diorama.bake.BlockLooks.get(), sample.u(), sample.v(), TileKey.SURFACE, 64);
+				if (restored.chunkCount() != 0 || pick.approximate() || !pick.position().equals(sample.location().position())
+					|| !pick.biome().equals(sample.location().biome())) {
+					throw new AssertionError("A saved map lost its coordinates or biome without snapshots");
+				}
+			});
+			context.waitFor(mc -> {
+				old.want(sample.key(), 0);
+				old.update();
+				return old.peek(sample.key()) != null;
+			}, 300);
+			context.runOnClient(mc -> {
+				var pick = old.pick(dev.diorama.bake.BlockLooks.get(), sample.u(), sample.v(), TileKey.SURFACE, 64);
+				if (pick == null || !pick.approximate() || pick.biome() != null) {
+					throw new AssertionError("An image-only saved map can't be pinned, or invents a biome");
+				}
+				if (old.pick(dev.diorama.bake.BlockLooks.get(), sample.u() + 10_000, sample.v(), TileKey.SURFACE, 64) != null) {
+					throw new AssertionError("An unexplored spot was treated as mapped terrain");
+				}
+			});
+			world.getServer().runCommand("tp @a " + ((int) sample.u() + 2000) + " 180 " + sample.location().position().getZ());
+			context.waitFor(mc -> mc.player != null && Math.abs(mc.player.getX() - sample.u()) > 1500, 400);
+			context.waitTicks(80);
+			context.runOnClient(mc -> {
+				BlockPos pos = sample.location().position();
+				if (mc.level.getChunkSource().getChunk(pos.getX() >> 4, pos.getZ() >> 4, net.minecraft.world.level.chunk.status.ChunkStatus.FULL, false) != null) {
+					throw new AssertionError("The test's original chunk is still loaded");
+				}
+				String biome = dev.diorama.bake.MapPick.biomeAt(MapSession.get().map(), pos);
+				if (!sample.location().biome().equals(biome)) {
+					throw new AssertionError("Unloading the live chunk changed the captured biome to " + biome);
+				}
+			});
+			context.setScreen(MapScreen::new);
+			context.runOnClient(mc -> ((MapScreen) mc.gui.screen()).lookAt(sample.u(), sample.v(), 3, TileKey.SURFACE));
+			context.waitTicks(20);
+			double[] cursor = context.computeOnClient(mc -> {
+				var view = ((MapScreen) mc.gui.screen()).view();
+				double scale = mc.getWindow().getGuiScale();
+				return new double[] {view.screenX(sample.u()) * scale, view.screenY(sample.v()) * scale};
+			});
+			rightClickAt(context, cursor[0], cursor[1]);
+			List<String> menu = context.computeOnClient(mc -> ((MapScreen) mc.gui.screen()).menu().labels());
+			if (!menu.contains("Add waypoint here")) {
+				throw new AssertionError("The distant terrain has no waypoint action: " + menu);
+			}
+			context.takeScreenshot("map-picking-distant-waypoint");
+			clickMenu(context, "Add waypoint here");
+			context.runOnClient(mc -> {
+				if (!(mc.gui.screen() instanceof WaypointEditScreen)) {
+					throw new AssertionError("The distant waypoint action didn't open the editor");
+				}
+			});
+			context.setScreen(() -> null);
+		} finally {
+			context.runOnClient(mc -> {
+				restored.close();
+				old.close();
+			});
+			try (var paths = java.nio.file.Files.walk(folder)) {
+				for (var path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) {
+					java.nio.file.Files.delete(path);
+				}
+			} catch (java.io.IOException e) {
+				throw new AssertionError(e);
+			}
+		}
+	}
+
 	private static Set<String> selectedTests() {
 		String env = System.getenv("DIORAMA_TESTS");
 		if ("1".equals(System.getenv("DIORAMA_STYLES"))) {
@@ -3243,10 +3377,10 @@ public class DioramaClientTest implements FabricClientGameTest {
 		}
 		if (env == null || env.isBlank()) {
 			//? if >=1.21.4 && fabric {
-			return Set.of("tour", "radar", "waypoints", "xaero-import", "fog-of-war", "settings", "overlays", "screens", "dimensions", "saved-map", "multiplayer", "server-id", "tracked-players");
+			return Set.of("tour", "radar", "waypoints", "xaero-import", "fog-of-war", "settings", "overlays", "screens", "dimensions", "saved-map", "map-picking", "multiplayer", "server-id", "tracked-players");
 			//?} else {
 			/*// On NeoForge and before 1.21.4 the tests run on src/gameshim, which can't start a dedicated server.
-			return Set.of("tour", "radar", "waypoints", "xaero-import", "fog-of-war", "settings", "overlays", "screens", "dimensions", "saved-map");
+			return Set.of("tour", "radar", "waypoints", "xaero-import", "fog-of-war", "settings", "overlays", "screens", "dimensions", "saved-map", "map-picking");
 			*///?}
 		}
 		return Set.of(env.split(","));

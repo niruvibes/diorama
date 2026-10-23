@@ -351,6 +351,10 @@ public final class TileBaker {
 	public static TileImage bake(
 		TileKey key, ChunkSource source, BlockLooks looks, @Nullable BitSet blocks, boolean fogOfWar, int @Nullable [] saved, @Nullable Overlays overlays
 	) {
+		// The saved location samples and the colour rays must see the same snapshots.
+		if (!fogOfWar && !key.isCave()) {
+			source = new PinnedSource(source);
+		}
 		TileBaker baker = new TileBaker(key, source, looks, fogOfWar, overlays);
 		int size = Projection.TILE_PIXELS;
 		if (blocks == null) {
@@ -358,7 +362,8 @@ public final class TileBaker {
 			byte[] info = overlays == null ? null : new byte[size * size];
 			baker.bakePixels(0, 0, size, size, pixels, info);
 			merge(pixels, saved, 0, 0, size);
-			return TileImage.full(key, Mipmaps.build(pixels, size), coverage(pixels, size, size), info);
+			return TileImage.full(key, Mipmaps.build(pixels, size), coverage(pixels, size, size), info)
+				.withLocations(MapPick.locations(key, source, looks, fogOfWar, null));
 		}
 		int perRow = size / TileImage.BLOCK;
 		List<TileImage.Patch> patches = new ArrayList<>();
@@ -380,7 +385,7 @@ public final class TileBaker {
 			}
 			dev.diorama.Diorama.LOGGER.info("Partial bake of {} ({} blocks) hit unknown chunks:{}", key, blocks.cardinality(), sb);
 		}
-		return TileImage.partial(key, patches);
+		return TileImage.partial(key, patches).withLocations(MapPick.locations(key, source, looks, fogOfWar, blocks));
 	}
 
 	/**

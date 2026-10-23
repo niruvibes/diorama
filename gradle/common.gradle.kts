@@ -37,3 +37,15 @@ tasks.named<Jar>("jar") {
 		rename { "${it}_diorama" }
 	}
 }
+
+// These saved-map regressions exercise real files without starting Minecraft or a display.
+extensions.getByType<SourceSetContainer>().matching { it.name == "gametest" }.configureEach {
+	val checks = this
+	val savedMapChecks = tasks.register<JavaExec>("runSavedMapChecks") {
+		group = "verification"
+		description = "Checks Realm map recovery and saved overview consistency without launching the game"
+		classpath = checks.runtimeClasspath
+		mainClass.set("dev.diorama.data.SavedMapChecks")
+	}
+	tasks.named("check") { dependsOn(savedMapChecks) }
+}

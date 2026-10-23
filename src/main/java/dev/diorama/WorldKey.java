@@ -1,5 +1,6 @@
 package dev.diorama;
 
+import dev.diorama.data.RealmMigration;
 import dev.diorama.mixin.BiomeManagerAccessor;
 import java.io.IOException;
 import java.lang.ref.WeakReference;
@@ -8,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.Locale;
 import java.util.Map;
@@ -23,8 +25,8 @@ import org.jspecify.annotations.Nullable;
 
 /**
  * Names the world the client is in, so per-world data (waypoints, the saved map) lands in its
- * own folder: the save folder for singleplayer; for multiplayer, the server address and the
- * server's name for the world, since one address can lead to several worlds (a network's lobby
+ * own folder: the save folder for singleplayer; for multiplayer, the server address (or permanent
+ * Realm ID and slot) and the server's name for the world, since one address can lead to several worlds (a network's lobby
  * and survival servers, or a map reset).
  *
  * <p>Servers built around Xaero's mods name their worlds with a level ID (see
@@ -65,6 +67,8 @@ public final class WorldKey {
 	}
 
 	private static final Map<ClientLevel, Naming> LEVELS = new WeakHashMap<>();
+	/** Attached to the actual connection's server entry by RealmsServerMixin, before joining. */
+	private static final Map<ServerData, String> REALMS = Collections.synchronizedMap(new WeakHashMap<>());
 	/** The last ID this server sent since the player joined it, for levels it doesn't name. */
 	private static @Nullable Integer lastId;
 	/** Whether this server named a world on an earlier visit, once asked. See {@link #namedBefore}. */
@@ -116,6 +120,16 @@ public final class WorldKey {
 			return seen.key;
 		}
 		String key = id != null ? idKey(data, id) : seedKey(data, level);
+		if (realm) {
+			// Older versions used the Realm's temporary IP. Recover those maps before opening
+			// either the tile store or the waypoints, and keep the originals as backups.
+			String seed = HexFormat.of().toHexDigits(((BiomeManagerAccessor) level.getBiomeManager()).diorama$biomeZoomSeed());
+			try {
+				RealmMigration.prepare(folder(key).getParent(), key, seed);
+			} catch (IOException | RuntimeException e) {
+				Diorama.LOGGER.error("Couldn't recover this Realm's older maps; their original folders are intact", e);
+			}
+		}
 		last = new Last(new WeakReference<>(data), new WeakReference<>(level), data.ip, realm, id, key);
 		return key;
 	}
@@ -172,8 +186,20 @@ public final class WorldKey {
 		return namedBefore;
 	}
 
-	private static String address(ServerData data) {
-		return key(data.isRealm() ? "realms" : "server", data.ip);
+	static String address(ServerData data) {
+		if (data.isRealm()) {
+			// A Realm can get a new IP every time it starts. Its service ID and slot stay put.
+			// A custom launcher that bypasses the Realms connection still gets a seed-based
+			// identity, rather than going back to the temporary address.
+			String identity = REALMS.get(data);
+			return key("realm", identity == null ? "unknown" : identity);
+		}
+		return key("server", data.ip);
+	}
+
+	/** Called when Realms creates the server entry used by the connection, including quick play. */
+	public static void realm(ServerData data, long id, int slot) {
+		REALMS.put(data, id + "-slot-" + slot);
 	}
 
 	private static String idPrefix(ServerData data) {
