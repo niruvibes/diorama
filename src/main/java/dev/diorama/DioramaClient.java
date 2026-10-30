@@ -8,6 +8,7 @@ import dev.diorama.waypoint.Waypoint;
 import dev.diorama.waypoint.WaypointEditScreen;
 import dev.diorama.waypoint.WaypointListScreen;
 import dev.diorama.waypoint.Waypoints;
+import dev.diorama.waypoint.Waystones;
 import java.util.List;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
@@ -36,8 +37,10 @@ public final class DioramaClient {
 	public static final KeyMapping ZOOM_OUT = new KeyMapping("key.diorama.zoom_out", InputConstants.KEY_MINUS, CATEGORY);
 	public static final KeyMapping SETTINGS = new KeyMapping("key.diorama.settings", InputConstants.UNKNOWN.getValue(), CATEGORY);
 	public static final KeyMapping TOGGLE_MINIMAP = new KeyMapping("key.diorama.toggle_minimap", InputConstants.UNKNOWN.getValue(), CATEGORY);
+	/** Held, the minimap shows at its enlarged size. Unbound to start with: zoom mods and others claim the free letters. */
+	public static final KeyMapping ENLARGE_MINIMAP = new KeyMapping("key.diorama.enlarge_minimap", InputConstants.UNKNOWN.getValue(), CATEGORY);
 	/** Every key binding, for the loader to register. */
-	public static final List<KeyMapping> KEY_MAPPINGS = List.of(OPEN_MAP, NEW_WAYPOINT, WAYPOINT_LIST, ZOOM_IN, ZOOM_OUT, SETTINGS, TOGGLE_MINIMAP);
+	public static final List<KeyMapping> KEY_MAPPINGS = List.of(OPEN_MAP, NEW_WAYPOINT, WAYPOINT_LIST, ZOOM_IN, ZOOM_OUT, SETTINGS, TOGGLE_MINIMAP, ENLARGE_MINIMAP);
 
 	private DioramaClient() {
 	}
@@ -66,7 +69,11 @@ public final class DioramaClient {
 
 	/** Called at the end of every client tick. */
 	public static void tick(Minecraft mc) {
+		// On the first tick every mod is set up, Waystones and its event library included.
+		Waystones.start();
 		MapSession.tick(mc);
+		Waypoints.watchSleep(mc);
+		Claims.tick(mc);
 		while (OPEN_MAP.consumeClick()) {
 			if (mc.gui.screen() == null && mc.level != null && ServerRules.minimapAllowed()) {
 				mc.gui.setScreen(new MapScreen());

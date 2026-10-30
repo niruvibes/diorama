@@ -65,6 +65,9 @@ public final class WaypointEditScreen extends Screen {
 	/** The custom folder name, or empty for the dimension's own folder. */
 	private String folder;
 	private @Nullable Button folderButton;
+	/** The icon picked, by {@link dev.diorama.render.WaypointIcons} id; empty shows the initials. */
+	private String icon;
+	private @Nullable Button iconButton;
 
 	public WaypointEditScreen(@Nullable Screen parent, Waypoint waypoint, boolean isNew) {
 		super(Component.translatable(isNew ? "diorama.waypoint.new" : "diorama.waypoint.edit"));
@@ -73,6 +76,7 @@ public final class WaypointEditScreen extends Screen {
 		this.isNew = isNew;
 		this.color = waypoint.color;
 		this.visible = waypoint.visible;
+		this.icon = waypoint.icon == null ? "" : waypoint.icon;
 		WaypointStore store = WaypointStore.get();
 		String known = store == null ? null : store.folderName(waypoint.folder);
 		this.folder = known == null ? "" : known;
@@ -93,8 +97,12 @@ public final class WaypointEditScreen extends Screen {
 		int top = this.top();
 		int cx = left + FORM / 2;
 		// Resizing the window or changing GUI scale runs init() again: keep what's typed, not the saved waypoint.
-		this.name = this.field(left, top + 16, 156, draft(this.name, this.waypoint.name), "diorama.waypoint.name", 32);
-		this.initials = this.field(left + 160, top + 16, 40, draft(this.initials, this.waypoint.initials), "diorama.waypoint.initials", 2);
+		this.name = this.field(left, top + 16, 112, draft(this.name, this.waypoint.name), "diorama.waypoint.name", 32);
+		this.iconButton = this.addRenderableWidget(Button.builder(this.iconLabel(), b -> this.pickIcon())
+			.bounds(left + 116, top + 16, 40, 20).build());
+		// A death marker always shows its headstone.
+		this.iconButton.active = this.waypoint.kind != Waypoint.Kind.DEATH;
+		this.initials = this.field(left + 160, top + 16, 40, draft(this.initials, this.waypoint.initials), "diorama.waypoint.initials", Waypoint.MAX_INITIALS);
 		this.x = this.field(left, top + 56, 64, draft(this.x, Integer.toString(this.waypoint.x)), "diorama.waypoint.x", 9);
 		this.y = this.field(left + 68, top + 56, 64, draft(this.y, Integer.toString(this.waypoint.y)), "diorama.waypoint.y", 9);
 		this.z = this.field(left + 136, top + 56, 64, draft(this.z, Integer.toString(this.waypoint.z)), "diorama.waypoint.z", 9);
@@ -116,11 +124,24 @@ public final class WaypointEditScreen extends Screen {
 		// Always a new colour, never close to the one shown.
 		this.addRenderableWidget(Button.builder(Component.translatable("diorama.waypoint.random"), b -> this.pick(WaypointColours.random(this.color)))
 			.bounds(left + 98, top + 132, FORM - 98, 20).build());
+		//? if >=1.21 {
 		this.addRenderableWidget(Checkbox.builder(Component.translatable("diorama.waypoint.show_on_maps"), this.font)
 			.pos(left, top + 157)
 			.selected(this.visible)
 			.onValueChange((box, value) -> this.visible = value)
 			.build());
+		//?} else {
+		/*// 1.20.1's checkbox has no builder and tells no one it changed: a 20 pixel box with the
+		// label 4 pixels right of it.
+		Component showOnMaps = Component.translatable("diorama.waypoint.show_on_maps");
+		this.addRenderableWidget(new Checkbox(left, top + 157, 24 + this.font.width(showOnMaps), 20, showOnMaps, this.visible) {
+			@Override
+			public void onPress() {
+				super.onPress();
+				WaypointEditScreen.this.visible = this.selected();
+			}
+		});
+		*///?}
 
 		// What to do with this place, under its preview. A new waypoint has none until it's saved.
 		int previewLeft = left + PREVIEW_LEFT;
@@ -146,6 +167,27 @@ public final class WaypointEditScreen extends Screen {
 			.bounds(left + WIDTH - half, top + 192, half, 20).build());
 		this.validate();
 		this.setInitialFocus(this.name);
+	}
+
+	/** The icon's name cut to fit its narrow button. */
+	private Component iconLabel() {
+		String text = WaypointIconScreen.name(this.icon).getString();
+		if (this.font.width(text) > 34) {
+			text = this.font.plainSubstrByWidth(text, 34 - this.font.width("..")) + "..";
+		}
+		return Component.literal(text);
+	}
+
+	private void pickIcon() {
+		this.preview.name = this.name.getValue().trim().isEmpty() ? this.waypoint.name : this.name.getValue().trim();
+		this.preview.initials = this.initials.getValue().trim().toUpperCase(Locale.ROOT);
+		this.preview.color = this.color;
+		this.minecraft.gui.setScreen(new WaypointIconScreen(this, this.preview, this.icon, id -> {
+			this.icon = id;
+			if (this.iconButton != null) {
+				this.iconButton.setMessage(this.iconLabel());
+			}
+		}));
 	}
 
 	private int previewTop() {
@@ -227,11 +269,16 @@ public final class WaypointEditScreen extends Screen {
 
 	@Override
 	public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float a) {
+		// A 1.20.1 screen draws its own background.
+		//? if <1.21 {
+		/*this.renderBackground(graphics);
+		*///?}
 		super.extractRenderState(graphics, mouseX, mouseY, a);
 		int left = this.left();
 		int top = this.top();
 		graphics.centeredText(this.font, this.title, this.width / 2, top - 12, 0xFFFFFFFF);
 		graphics.text(this.font, Component.translatable("diorama.waypoint.name"), left, top + 5, LABEL, true);
+		graphics.text(this.font, Component.translatable("diorama.waypoint.icon"), left + 116, top + 5, LABEL, true);
 		graphics.text(this.font, Component.translatable("diorama.waypoint.initials"), left + 160, top + 5, LABEL, true);
 		graphics.text(this.font, Component.translatable("diorama.waypoint.position"), left, top + 45, LABEL, true);
 		Component colourLabel = Component.translatable("diorama.waypoint.colour");
@@ -390,8 +437,11 @@ public final class WaypointEditScreen extends Screen {
 		this.preview.initials = this.initials.getValue().trim().toUpperCase(Locale.ROOT);
 		this.preview.color = this.color;
 		this.preview.kind = this.waypoint.kind;
+		this.preview.icon = this.icon;
 		// At twice its size, the pin reaches this far above its tip: its head, its rim and its point.
-		int rise = Math.round(2 * (Pins.headAbove(Pins.LARGE) + Pins.LARGE / 2.0F + 1)) - this.piece.tipY();
+		// An icon's pin is bigger.
+		float radius = Pins.reach(this.preview, Pins.LARGE) - 1;
+		int rise = Math.round(2 * (Pins.headAbove(this.preview, Pins.LARGE) + radius)) - this.piece.tipY();
 		int total = rise + this.piece.outerHeight();
 		int pieceX = (x0 + x1) / 2 - this.piece.outerWidth() / 2;
 		int pieceY = y0 + (y1 - y0 - total) / 2 + rise;
@@ -523,6 +573,7 @@ public final class WaypointEditScreen extends Screen {
 		this.waypoint.y = shown.y;
 		this.waypoint.z = shown.z;
 		this.waypoint.color = this.color;
+		this.waypoint.icon = this.icon;
 		this.waypoint.visible = this.visible;
 		this.waypoint.folder = this.folder;
 		// Saving a temporary waypoint from the editor keeps it; otherwise a renamed one would still

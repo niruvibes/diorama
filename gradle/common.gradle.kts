@@ -43,7 +43,7 @@ extensions.getByType<SourceSetContainer>().matching { it.name == "gametest" }.co
 	val checks = this
 	val savedMapChecks = tasks.register<JavaExec>("runSavedMapChecks") {
 		group = "verification"
-		description = "Checks Realm map recovery and saved overview consistency without launching the game"
+		description = "Checks compatibility with older fork saved locations without launching the game"
 		classpath = checks.runtimeClasspath
 		mainClass.set("dev.diorama.data.SavedMapChecks")
 	}

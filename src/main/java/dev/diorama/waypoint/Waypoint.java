@@ -12,7 +12,11 @@ public final class Waypoint {
 		/** Added automatically where the player died. */
 		DEATH,
 		/** Set from the map's menu; never saved, so it's gone once the player leaves the world. */
-		TEMPORARY
+		TEMPORARY,
+		/** A waystone the Waystones mod told the client about ({@link Waystones}). Never saved, and Waystones names it. */
+		WAYSTONE,
+		/** The bed the player last slept in, kept up to date: one per dimension. */
+		BED
 	}
 
 	/** Colours a waypoint can take, picked to stay readable on both grass and water. */
@@ -21,9 +25,14 @@ public final class Waypoint {
 		0xFFD6409F, 0xFFFFFFFF, 0xFFB0B4BA, 0xFF60646C, 0xFF8D6B4B, 0xFF99D52A, 0xFF7CE2FE, 0xFFF0C0D8
 	};
 
+	/** The most letters a pin's initials can have; the pin's head widens to hold more than two. */
+	public static final int MAX_INITIALS = 4;
+
 	public UUID id = UUID.randomUUID();
 	public String name = "";
 	public String initials = "";
+	/** A picture the pin shows instead of the initials, by {@link dev.diorama.render.WaypointIcons} id, or empty. */
+	public String icon = "";
 	public int x;
 	public int y;
 	public int z;
@@ -35,6 +44,8 @@ public final class Waypoint {
 	public String folder = "";
 	public Kind kind = Kind.MANUAL;
 	public long created = System.currentTimeMillis();
+	/** The dimension's map it was made on ({@link dev.diorama.Maps}); null for the main map. */
+	public @org.jspecify.annotations.Nullable String map;
 
 	public Waypoint() {
 	}
@@ -47,6 +58,11 @@ public final class Waypoint {
 		this.z = z;
 		this.dimension = dimension;
 		this.color = color;
+	}
+
+	/** Whether the player can edit or delete it here: everything but waystones, which Waystones owns. */
+	public boolean editable() {
+		return this.kind != Kind.WAYSTONE;
 	}
 
 	public String label() {

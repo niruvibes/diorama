@@ -34,8 +34,15 @@ public final class MapViewport {
 	private record MaskInputs(long coverageVersion, int layer, int lod, double originU, double originV, double texel, boolean rounded, int scaleSteps, boolean fast) {
 	}
 
-	/** Where and how big a map is drawn, and what part of the map it shows. */
-	public record View(int x, int y, int width, int height, double centerU, double centerV, double zoom, int layer) {
+	/**
+	 * Where and how big a map is drawn, and what part of the map it shows. A {@code round} view
+	 * shows only the circle filling it (the round minimap).
+	 */
+	public record View(int x, int y, int width, int height, double centerU, double centerV, double zoom, int layer, boolean round) {
+		public View(int x, int y, int width, int height, double centerU, double centerV, double zoom, int layer) {
+			this(x, y, width, height, centerU, centerV, zoom, layer, false);
+		}
+
 		public double minU() {
 			return this.centerU - this.width / 2.0 / this.zoom;
 		}
@@ -56,20 +63,45 @@ public final class MapViewport {
 	/** Below this zoom (GUI pixels per block) overlay lines and dots would blur into noise. */
 	private static final double OVERLAY_ZOOM = 1.0;
 
-	public void draw(GuiGraphicsExtractor graphics, MapLevel level, View view) {
-		this.draw(graphics, level, view, 0);
+	/** The most the fog shader's opacity code can say: it has five spare bits. */
+	private static final int OPACITY_CODES = 31;
+
+	/** How opaque the map draws, 0 to 1. */
+	private float opacity = 1;
+
+	/**
+	 * Sets how opaque this map is drawn: the tiles and the fog, and not the backdrop behind them, so
+	 * the game shows through. The fullscreen map leaves it at 1; the minimap takes it from the settings.
+	 */
+	public void opacity(float opacity) {
+		this.opacity = Math.max(0, Math.min(1, opacity));
 	}
 
-	/** Same, with these {@link dev.diorama.bake.Overlays} bits drawn over the tiles. */
-	public void draw(GuiGraphicsExtractor graphics, MapLevel level, View view, int overlays) {
+	public void draw(GuiGraphicsExtractor graphics, MapLevel level, View view) {
+		this.draw(graphics, level, view, 0, false);
+	}
+
+	/**
+	 * Same, with these {@link dev.diorama.bake.Overlays} bits drawn over the tiles, and land
+	 * claims if {@code claims}.
+	 */
+	public void draw(GuiGraphicsExtractor graphics, MapLevel level, View view, int overlays, boolean claims) {
 		graphics.enableScissor(view.x(), view.y(), view.x() + view.width(), view.y() + view.height());
 		boolean cave = view.layer() != TileKey.SURFACE;
 		// Behind the tiles, a colour from the fog that covers where there's no data, so the ragged
 		// edge of known ground blends into it: clouds, smoke under a roof, or the dark of caves.
 		int background = cave ? 0xFF0C0E12 : level.roofless() ? 0xFF29211F : 0xFF8C99AB;
-		graphics.fill(view.x(), view.y(), view.x() + view.width(), view.y() + view.height(), background);
+		// A see-through map has no backdrop: drawn under tiles that are themselves see-through, it
+		// would show through them and tint the game behind.
+		if (this.opacity < 1) {
+			// Nothing to draw.
+		} else if (view.round()) {
+			MapCanvas.of(graphics).solid(Circle.in(view).disc(), background);
+		} else {
+			graphics.fill(view.x(), view.y(), view.x() + view.width(), view.y() + view.height(), background);
+		}
 
-		this.drawTiles(graphics, level, view, view.zoom() >= OVERLAY_ZOOM ? overlays : 0);
+		this.drawTiles(graphics, level, view, view.zoom() >= OVERLAY_ZOOM ? overlays : 0, claims);
 		this.drawFog(graphics, level, view);
 		graphics.disableScissor();
 	}
@@ -135,7 +167,7 @@ public final class MapViewport {
 		return Math.sqrt(du * du + dv * dv);
 	}
 
-	private void drawTiles(GuiGraphicsExtractor graphics, MapLevel level, View view, int overlays) {
+	private void drawTiles(GuiGraphicsExtractor graphics, MapLevel level, View view, int overlays, boolean claims) {
 		int lod = lodFor(level, view);
 		double units = (double) Projection.TILE_UNITS * (1 << lod);
 		double u0 = view.minU();
@@ -150,6 +182,9 @@ public final class MapViewport {
 		Sampling sampling = view.zoom() >= Projection.PIXELS_PER_UNIT ? Sampling.TILE_CRISP : Sampling.TILE_SMOOTH;
 		MapCanvas canvas = MapCanvas.of(graphics);
 		float size = (float) (units * view.zoom());
+		Circle circle = view.round() ? Circle.in(view) : null;
+		// White, as see-through as the map is: the tiles are multiplied by it.
+		int tint = Math.round(this.opacity * 255) << 24 | 0xFFFFFF;
 		for (int tu = tu0 - 1; tu <= tu1 + 1; tu++) {
 			for (int tv = tv0 - 1; tv <= tv1 + 1; tv++) {
 				TileKey key = new TileKey(view.layer(), tu, tv, lod);
@@ -163,10 +198,27 @@ public final class MapViewport {
 				}
 				float sx = view.screenX(tu * units);
 				float sy = view.screenY(tv * units);
-				canvas.rect(tile.texture(), sampling, sx, sy, sx + size, sy + size, 0, 0, 1, 1, -1);
 				MapTexture overlay = overlays == 0 || lod > 0 ? null : tile.overlay(overlays);
+				MapTexture claimed = claims ? level.claims(key, tile) : null;
+				if (circle != null) {
+					Circle.Quads inside = circle.clip(sx, sy, sx + size, sy + size, 0, 0, 1, 1);
+					if (inside != null) {
+						canvas.quad(tile.texture(), sampling, inside.corners(), inside.uvs(), tint);
+						if (claimed != null) {
+							canvas.quad(claimed, sampling, inside.corners(), inside.uvs(), tint);
+						}
+						if (overlay != null) {
+							canvas.quad(overlay, sampling, inside.corners(), inside.uvs(), tint);
+						}
+					}
+					continue;
+				}
+				canvas.rect(tile.texture(), sampling, sx, sy, sx + size, sy + size, 0, 0, 1, 1, tint);
+				if (claimed != null) {
+					canvas.rect(claimed, sampling, sx, sy, sx + size, sy + size, 0, 0, 1, 1, tint);
+				}
 				if (overlay != null) {
-					canvas.rect(overlay, sampling, sx, sy, sx + size, sy + size, 0, 0, 1, 1, -1);
+					canvas.rect(overlay, sampling, sx, sy, sx + size, sy + size, 0, 0, 1, 1, tint);
 				}
 			}
 		}
@@ -207,9 +259,20 @@ public final class MapViewport {
 		// The mask scale code takes the alpha byte's high nibble; 4 in the low nibble asks for fast
 		// fog, and 1 for smoke instead of clouds over the sky view under a roof.
 		int quality = (fast ? 4 : 0) | (level.roofless() ? 1 : 0);
-		int params = (scaleCode * 16 | quality) << 24 | (noiseU * 32) << 16 | (noiseV * 32) << 8 | fogCode;
+		// The low five bits of the noise offset's red byte hold how see-through the fog is, 0 for
+		// not at all, so a caller that sets nothing there gets the fog it always did.
+		int veil = Math.round((1 - this.opacity) * OPACITY_CODES);
+		int params = (scaleCode * 16 | quality) << 24 | (noiseU * 32 | veil) << 16 | (noiseV * 32) << 8 | fogCode;
 
-		MapCanvas.of(graphics).fog(
+		MapCanvas canvas = MapCanvas.of(graphics);
+		if (view.round()) {
+			Circle.Quads disc = Circle.in(view).clip(view.x(), view.y(), view.x() + view.width(), view.y() + view.height(), mu0, mv0, mu1, mv1);
+			if (disc != null) {
+				canvas.fog(this.maskTexture, FogTextures.noise(), disc.corners(), disc.uvs(), view.x(), view.y(), view.width(), view.height(), params);
+			}
+			return;
+		}
+		canvas.fog(
 			this.maskTexture, FogTextures.noise(),
 			view.x(), view.y(), view.width(), view.height(),
 			mu0, mv0, mu1, mv1,

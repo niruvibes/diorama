@@ -3,6 +3,8 @@ package dev.diorama.render.gpu;
 
 import dev.diorama.render.DioramaPipelines;
 import dev.diorama.render.QuadElement;
+import dev.diorama.render.QuadsElement;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 //? if >=26.1 {
 import net.minecraft.client.gui.components.PlayerFaceExtractor;
@@ -13,6 +15,7 @@ import net.minecraft.client.gui.navigation.ScreenRectangle;
 import net.minecraft.client.gui.render.TextureSetup;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.resources.Identifier;
 import org.joml.Matrix3x2f;
 
@@ -56,6 +59,34 @@ final class StateCanvas implements MapCanvas {
 	}
 
 	@Override
+	public void solids(float[] xyz, int[] colors, int quads) {
+		this.graphics.guiRenderState.addGuiElement(QuadsElement.of(
+			RenderPipelines.GUI, TextureSetup.noTexture(), xyz, null, colors, quads, this.graphics.scissorStack.peek()
+		));
+	}
+
+	@Override
+	public void blits(Identifier texture, float[] xyz, float[] uvs, int[] colors, int quads) {
+		// Set up the way the GUI's own blit sets up a game texture.
+		AbstractTexture gameTexture = Minecraft.getInstance().getTextureManager().getTexture(texture);
+		//? if >=1.21.11 {
+		TextureSetup textures = TextureSetup.singleTexture(gameTexture.getTextureView(), gameTexture.getSampler());
+		//?} else {
+		/*TextureSetup textures = TextureSetup.singleTexture(gameTexture.getTextureView());
+		*///?}
+		this.graphics.guiRenderState.addGuiElement(QuadsElement.of(
+			RenderPipelines.GUI_TEXTURED, textures, xyz, uvs, colors, quads, this.graphics.scissorStack.peek()
+		));
+	}
+
+	@Override
+	public void rects(MapTexture texture, Sampling sampling, float[] xyz, float[] uvs, int[] colors, int quads) {
+		this.graphics.guiRenderState.addGuiElement(QuadsElement.of(
+			RenderPipelines.GUI_TEXTURED, ((StateTexture) texture).single(sampling), xyz, uvs, colors, quads, this.graphics.scissorStack.peek()
+		));
+	}
+
+	@Override
 	public void playerFace(AbstractClientPlayer player, int x, int y, int size, int argb) {
 		//? if >=26.1 {
 		PlayerFaceExtractor.extractRenderState(this.graphics, player.getSkin(), x, y, size, argb);
@@ -65,13 +96,13 @@ final class StateCanvas implements MapCanvas {
 	}
 
 	@Override
-	public void fog(MapTexture mask, MapTexture noise, int x, int y, int width, int height, float u0, float v0, float u1, float v1, int params) {
-		this.graphics.guiRenderState.addGuiElement(QuadElement.rect(
+	public void fog(MapTexture mask, MapTexture noise, float[] corners, float[] uvs, int x, int y, int width, int height, int params) {
+		this.graphics.guiRenderState.addGuiElement(QuadElement.of(
 			DioramaPipelines.FOG,
 			StateTexture.pair((StateTexture) mask, Sampling.CLAMP_LINEAR, (StateTexture) noise, Sampling.REPEAT_LINEAR),
 			new Matrix3x2f(this.graphics.pose()),
-			x, y, x + width, y + height,
-			u0, v0, u1, v1,
+			corners,
+			uvs,
 			params,
 			new ScreenRectangle(x, y, width, height)
 		));

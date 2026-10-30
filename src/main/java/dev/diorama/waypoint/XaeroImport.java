@@ -1,6 +1,7 @@
 package dev.diorama.waypoint;
 
 import dev.diorama.Diorama;
+import dev.diorama.WorldKey;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -47,7 +48,6 @@ public final class XaeroImport {
 		"gui.xaero_deathpoint_old", "Old Death"
 	);
 	private static final int MAX_NAME = 32;
-	private static final int MAX_INITIALS = 2;
 	private static final int MAX_HORIZONTAL = 30_000_000;
 	private static final int MAX_VERTICAL = 4096;
 	/** About 50,000 waypoints; anything bigger isn't a waypoint file. */
@@ -103,7 +103,7 @@ public final class XaeroImport {
 			List<String> roots;
 			if (server != null) {
 				roots = singleplayerFolders(server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize().getFileName().toString());
-			} else if (data != null && !data.isRealm()) {
+			} else if (data != null && !WorldKey.isRealm(data)) {
 				//? if fabric {
 				Path config = FabricLoader.getInstance().getConfigDir();
 				//?} else {
@@ -393,7 +393,7 @@ public final class XaeroImport {
 				}
 				String name = WaypointShare.cut(WaypointShare.chatSafe(name(args[1].replace("§§", ":"))).trim(), MAX_NAME).trim();
 				Waypoint waypoint = new Waypoint(name.isEmpty() ? "Waypoint" : name, x, y, z, dimension, WaypointShare.nearestPaletteColor(color(color)));
-				String initials = WaypointShare.cut(WaypointShare.chatSafe(args[2].replace("§§", ":")).trim(), MAX_INITIALS);
+				String initials = WaypointShare.cut(WaypointShare.chatSafe(args[2].replace("§§", ":")).trim(), Waypoint.MAX_INITIALS);
 				if (!initials.isEmpty()) {
 					waypoint.initials = initials;
 				}

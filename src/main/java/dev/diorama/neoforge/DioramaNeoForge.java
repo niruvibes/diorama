@@ -1,8 +1,10 @@
 package dev.diorama.neoforge;
 
+import dev.diorama.Claims;
 import dev.diorama.Diorama;
 import dev.diorama.DioramaClient;
 import dev.diorama.MapSession;
+import dev.diorama.Maps;
 import dev.diorama.MinimapHud;
 import dev.diorama.ServerRules;
 import dev.diorama.Settings;
@@ -10,12 +12,16 @@ import dev.diorama.SettingsScreen;
 import dev.diorama.TrackedPlayers;
 import dev.diorama.WorldKey;
 import dev.diorama.XaeroChannels;
+import dev.diorama.drawing.DrawingStore;
+import dev.diorama.bake.BlockLooks;
+import dev.diorama.render.XaeroRadarIcons;
 //? if >=1.21.6 {
 import dev.diorama.render.DioramaPipelines;
 //?}
 import dev.diorama.waypoint.WaypointHud;
 import dev.diorama.waypoint.WaypointShare;
 import dev.diorama.waypoint.WaypointStore;
+import dev.diorama.waypoint.Waystones;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -62,13 +68,13 @@ public final class DioramaNeoForge {
 		//? if >=1.21.6 {
 		modBus.addListener(RegisterRenderPipelinesEvent.class, event -> event.registerPipeline(DioramaPipelines.FOG));
 		//?}
-		// Above the whole vanilla HUD, in the same order as on Fabric: waypoint labels, then the
-		// minimap over them. Each layer already sits 200 deeper than the one before, which the Fabric
-		// jars before 1.21.6 have to make up for themselves.
+		// As on Fabric: waypoints in the world under the whole vanilla HUD and every screen, as part
+		// of the picture of the world, and the minimap above the HUD. Each layer already sits 200
+		// deeper than the one before, which the Fabric jars before 1.21.6 have to make up for themselves.
 		modBus.addListener(RegisterGuiLayersEvent.class, event -> {
 			WaypointHud waypoints = new WaypointHud();
 			MinimapHud minimap = new MinimapHud();
-			event.registerAboveAll(Diorama.id("waypoints"), (graphics, deltaTracker) -> waypoints.extractRenderState(graphics, deltaTracker));
+			event.registerBelowAll(Diorama.id("waypoints"), (graphics, deltaTracker) -> waypoints.extractRenderState(graphics, deltaTracker));
 			event.registerAboveAll(Diorama.id("minimap"), (graphics, deltaTracker) -> minimap.extractRenderState(graphics, deltaTracker));
 		});
 
@@ -86,19 +92,35 @@ public final class DioramaNeoForge {
 		NeoForge.EVENT_BUS.addListener(ClientPlayerNetworkEvent.LoggingOut.class, event -> {
 			ServerRules.onDisconnect();
 			WaypointStore.onLeave();
+			Maps.onLeave();
+			DrawingStore.onLeave();
 			WorldKey.onJoinOrLeave();
 			XaeroChannels.onJoinOrLeave();
 			TrackedPlayers.clear();
+			Waystones.clear();
+			Claims.clear();
 		});
 		// A network moving the player to another of its servers joins again without leaving.
 		NeoForge.EVENT_BUS.addListener(ClientPlayerNetworkEvent.LoggingIn.class, event -> {
 			ServerRules.onDisconnect();
 			WaypointStore.onLeave();
+			Maps.onLeave();
+			DrawingStore.onLeave();
 			WorldKey.onJoinOrLeave();
+			// Mods sync block ids from the server before this, which can number block states differently.
+			BlockLooks.invalidate();
 			XaeroChannels.onJoinOrLeave();
 			TrackedPlayers.clear();
+			Waystones.clear();
+			Claims.clear();
 		});
 		modBus.addListener(RegisterPayloadHandlersEvent.class, XaeroChannels::register);
+		// Radar icons from Xaero's Minimap's icon files, read again on every resource reload.
+		//? if >=1.21.4 {
+		modBus.addListener(net.neoforged.neoforge.client.event.AddClientReloadListenersEvent.class, event -> event.addListener(XaeroRadarIcons.ID, XaeroRadarIcons.LISTENER));
+		//?} else {
+		/*modBus.addListener(net.neoforged.neoforge.client.event.RegisterClientReloadListenersEvent.class, event -> event.registerReloadListener(XaeroRadarIcons.LISTENER));
+		*///?}
 		// Leaving a world saves the map on the next tick, but closing the window stops ticking. This
 		// fires as the window is asked to close, before the last frame, so from then on nothing may
 		// start the map again (Minecraft.isRunning() is false).

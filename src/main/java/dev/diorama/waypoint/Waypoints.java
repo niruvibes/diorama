@@ -31,6 +31,11 @@ public final class Waypoints {
 	/** A new, unsaved waypoint at a block position, named and coloured so the next one differs. */
 	public static @Nullable Waypoint at(BlockPos pos) {
 		String dimension = dimension();
+		return dimension == null ? null : at(pos, dimension);
+	}
+
+	/** Makes a pin in the dimension being browsed, without changing the player's dimension. */
+	public static @Nullable Waypoint at(BlockPos pos, String dimension) {
 		WaypointStore store = WaypointStore.get();
 		if (dimension == null || store == null) {
 			return null;
@@ -58,6 +63,12 @@ public final class Waypoints {
 	/** Adds a temporary waypoint at a block position: no editor, and it's never saved. */
 	public static void addTemporary(BlockPos pos) {
 		String dimension = dimension();
+		if (dimension != null) {
+			addTemporary(pos, dimension);
+		}
+	}
+
+	public static void addTemporary(BlockPos pos, String dimension) {
 		WaypointStore store = WaypointStore.get();
 		if (dimension == null || store == null) {
 			return;
@@ -68,18 +79,68 @@ public final class Waypoints {
 		store.add(temporary);
 	}
 
-	/** The server only sends the commands a player may use, so {@code tp} being there means it's allowed. */
+	/**
+	 * The server only sends the commands a player may use, so teleporting is offered when it sent
+	 * the teleport command's first word.
+	 */
 	public static boolean canTeleport() {
 		var connection = Minecraft.getInstance().getConnection();
-		return connection != null && connection.getCommands().getRoot().getChild("tp") != null;
+		String command = Settings.get().teleportCommand;
+		String name = command.split(" ", 2)[0];
+		return connection != null && connection.getCommands().getRoot().getChild(name) != null;
 	}
 
-	/** Sends {@code /tp} to a block position. */
+	/** Sends the player's teleport command, {@code /tp} unless they changed it, to a block position. */
 	public static void teleport(int x, int y, int z) {
 		LocalPlayer player = Minecraft.getInstance().player;
-		if (player != null) {
-			player.connection.sendCommand("tp @s " + x + " " + y + " " + z);
+		String command = Settings.get().teleportCommand
+			.replace("{x}", Integer.toString(x))
+			.replace("{y}", Integer.toString(y))
+			.replace("{z}", Integer.toString(z));
+		// The command packet holds 256 characters; a longer one throws instead of sending.
+		if (player != null && command.length() <= 256) {
+			player.connection.sendCommand(command);
 		}
+	}
+
+	private static boolean wasSleeping;
+
+	/**
+	 * Keeps a bed waypoint where the player last lay down to sleep, one per dimension, moved when
+	 * they sleep somewhere else. Lying down is what the client sees of the server setting their
+	 * respawn point. Called every tick.
+	 */
+	public static void watchSleep(Minecraft mc) {
+		LocalPlayer player = mc.player;
+		boolean sleeping = player != null && player.isSleeping();
+		if (sleeping && !wasSleeping && Settings.get().bedMarkers) {
+			// On joining a server the world may not be known yet; until it is, try again each tick.
+			sleeping = player.getSleepingPos().map(Waypoints::slept).orElse(true);
+		}
+		wasSleeping = sleeping;
+	}
+
+	/** Puts the bed pin on a bed; false if there's no world to keep it in yet. */
+	private static boolean slept(BlockPos pos) {
+		WaypointStore store = WaypointStore.get();
+		String dimension = dimension();
+		if (store == null || dimension == null) {
+			return false;
+		}
+		for (Waypoint waypoint : store.in(dimension)) {
+			if (waypoint.kind == Waypoint.Kind.BED) {
+				waypoint.x = pos.getX();
+				waypoint.y = pos.getY();
+				waypoint.z = pos.getZ();
+				store.changed();
+				return true;
+			}
+		}
+		Waypoint bed = new Waypoint("Bed", pos.getX(), pos.getY(), pos.getZ(), dimension, 0xFFE5484D);
+		bed.kind = Waypoint.Kind.BED;
+		bed.icon = dev.diorama.render.WaypointIcons.BED;
+		store.add(bed);
+		return true;
 	}
 
 	/** Adds a death marker where the player stands. Called when the server reports their death. */

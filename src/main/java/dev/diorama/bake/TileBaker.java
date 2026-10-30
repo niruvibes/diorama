@@ -178,7 +178,7 @@ public final class TileBaker {
 		this.key = key;
 		this.overlays = overlays;
 		this.looks = looks;
-		this.reader = new VoxelReader(source, looks.kind, looks.shape);
+		this.reader = new VoxelReader(source, looks, true);
 		this.cave = key.isCave();
 		this.roofless = !this.cave && source.roof() != ChunkSource.NO_ROOF;
 		this.lit = this.cave || this.roofless;
@@ -351,10 +351,6 @@ public final class TileBaker {
 	public static TileImage bake(
 		TileKey key, ChunkSource source, BlockLooks looks, @Nullable BitSet blocks, boolean fogOfWar, int @Nullable [] saved, @Nullable Overlays overlays
 	) {
-		// The saved location samples and the colour rays must see the same snapshots.
-		if (!fogOfWar && !key.isCave()) {
-			source = new PinnedSource(source);
-		}
 		TileBaker baker = new TileBaker(key, source, looks, fogOfWar, overlays);
 		int size = Projection.TILE_PIXELS;
 		if (blocks == null) {
@@ -362,8 +358,7 @@ public final class TileBaker {
 			byte[] info = overlays == null ? null : new byte[size * size];
 			baker.bakePixels(0, 0, size, size, pixels, info);
 			merge(pixels, saved, 0, 0, size);
-			return TileImage.full(key, Mipmaps.build(pixels, size), coverage(pixels, size, size), info)
-				.withLocations(MapPick.locations(key, source, looks, fogOfWar, null));
+			return TileImage.full(key, Mipmaps.build(pixels, size), coverage(pixels, size, size), info);
 		}
 		int perRow = size / TileImage.BLOCK;
 		List<TileImage.Patch> patches = new ArrayList<>();
@@ -385,7 +380,7 @@ public final class TileBaker {
 			}
 			dev.diorama.Diorama.LOGGER.info("Partial bake of {} ({} blocks) hit unknown chunks:{}", key, blocks.cardinality(), sb);
 		}
-		return TileImage.partial(key, patches).withLocations(MapPick.locations(key, source, looks, fogOfWar, blocks));
+		return TileImage.partial(key, patches);
 	}
 
 	/**
@@ -608,7 +603,7 @@ public final class TileBaker {
 			if (partial) {
 				double tIn = t;
 				boolean hit = this.enterShape(this.looks.shapes[shape], fx, y0, z0, by, bz, t, Math.min(tMaxY, tMaxZ), enteredTop);
-				int wet = this.looks.wetShapes.get(id);
+				int wet = this.looks.wetShape[id];
 				// Waterlogged: the ray is in water from where it came into the cell, unless it met
 				// the block right there, as on a fence top level with the water.
 				if (wet >= 0 && waterId < 0 && (!hit || this.shapeT > tIn)) {

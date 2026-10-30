@@ -90,6 +90,9 @@ stonecutter parameters {
 		"\\bgamerule show_death_messages\\b" to "gamerule showDeathMessages",
 		"\\bgamerule immediate_respawn\\b" to "gamerule doImmediateRespawn",
 		"\\bgamerule random_tick_speed\\b" to "gamerule randomTickSpeed",
+		// The F3 screen's on/off switch was named after the key.
+		"\\bdebugEntries\\.isOverlayVisible\\(\\)" to "debugEntries.isF3Visible()",
+		"\\bdebugEntries\\.toggleDebugOverlay\\(\\)" to "debugEntries.toggleF3Visible()",
 	)
 	for ((pattern, older) in before1_21_11) {
 		replacements.regex(current.parsed < "1.21.11") {
@@ -135,6 +138,7 @@ stonecutter parameters {
 		"\\.getMissingBlockStateModel\\(\\)" to ".getMissingModel()",
 		// Chat click and hover events were one class each, with an action.
 		"\\bnew ClickEvent\\.RunCommand\\(" to "new ClickEvent(ClickEvent.Action.RUN_COMMAND, ",
+		"\\bnew ClickEvent\\.OpenFile\\(" to "new ClickEvent(ClickEvent.Action.OPEN_FILE, ",
 		"\\bnew HoverEvent\\.ShowText\\(" to "new HoverEvent(HoverEvent.Action.SHOW_TEXT, ",
 		// Placing an entity (the tests do) was moving it.
 		"\\.snapTo\\(" to ".moveTo(",
@@ -162,4 +166,50 @@ stonecutter parameters {
 			replace(pattern, older, "(?!)", "never")
 		}
 	}
+
+	// From the 1.21 spelling to the 1.20.1 one (changed somewhere from 1.20.2 to 1.21; 1.20.1 is
+	// the only version before 1.21).
+	val before1_21 = listOf(
+		// Resource ids were built with constructors. Either spelling: the Identifier rename above
+		// may run first.
+		"\\b(?:net\\.minecraft\\.resources\\.)?(?:Identifier|ResourceLocation)\\.(?:fromNamespaceAndPath|withDefaultNamespace|parse)\\(" to "new net.minecraft.resources.ResourceLocation(",
+		// Chunk statuses had no package of their own.
+		"import net\\.minecraft\\.world\\.level\\.chunk\\.status\\.ChunkStatus;" to "import net.minecraft.world.level.chunk.ChunkStatus;",
+		"\\.getPersistedStatus\\(\\)" to ".getStatus()",
+		// The death packet had a getter for whose death it was.
+		"\\bpacket\\.playerId\\(\\)" to "packet.getPlayerId()",
+		// A built mesh was a RenderedBuffer, nested in BufferBuilder, which built it with end().
+		"import com\\.mojang\\.blaze3d\\.vertex\\.MeshData;" to "import com.mojang.blaze3d.vertex.BufferBuilder.RenderedBuffer;",
+		"\\bMeshData\\b" to "RenderedBuffer",
+		"\\.buildOrThrow\\(\\)" to ".end()",
+		// A player's skin texture had a getter of its own.
+		"\\.getSkin\\(\\)\\.texture\\(\\)" to ".getSkinTextureLocation()",
+		// A status effect instance held its effect itself, not a registry holder of it.
+		"\\.getEffect\\(\\)\\.value\\(\\)" to ".getEffect()",
+		// The test stand-in's names: the "saving world" screen had its dirt background in its name,
+		// and the renderer counted chunks, not sections.
+		"\\bGenericMessageScreen\\b" to "GenericDirtMessageScreen",
+		"\\.hasRenderedAllSections\\(\\)" to ".hasRenderedAllChunks()",
+		// Leaving a world was clearing the client's level.
+		"\\b(minecraft|mc)\\.disconnect\\(" to "$1.clearLevel(",
+		// The tests' checks: chat's allowed characters were in SharedConstants, and widgets had no
+		// right or bottom edge getters.
+		"\\bnet\\.minecraft\\.util\\.StringUtil\\.isAllowedChatCharacter\\(" to "net.minecraft.SharedConstants.isAllowedChatCharacter(",
+		"\\b(\\w+)\\.getRight\\(\\)" to "($1.getX() + $1.getWidth())",
+		"\\b(\\w+)\\.getBottom\\(\\)" to "($1.getY() + $1.getHeight())",
+		// Not a Minecraft change: the 1.20.1 jar is built for Java 17, which has no Math.clamp.
+		// Minecraft's own clamp has the int, float and double forms.
+		"\\bMath\\.clamp\\(" to "net.minecraft.util.Mth.clamp(",
+	)
+	for ((pattern, older) in before1_21) {
+		replacements.regex(current.parsed < "1.21") {
+			replace(pattern, older, "(?!)", "never")
+		}
+	}
 }
+
+// gradle.properties turns on configure-on-demand, but Stonecutter's switch and refresh tasks read
+// every version's source sets, which each version's own script adds; without this they skip
+// src/gametest and src/gameshim. Configure every version first. (At the end of this script:
+// earlier, the versions' scripts run before Stonecutter has set them up.)
+if (gradle.startParameter.taskNames.any { "active project" in it }) evaluationDependsOnChildren()

@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import net.minecraft.client.Minecraft;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Player settings, saved to {@code .minecraft/diorama/config.json}. Fields are public so Gson
@@ -33,10 +34,22 @@ public final class Settings {
 	public static final double[] ZOOMS = {0.75, 1, 1.5, 2, 3, 4};
 	/** Radar height ranges, in blocks. */
 	public static final int[] RANGES = {16, 32, 64, 128};
+	/** How near a waypoint has to be to show in the world and on the minimap, in blocks; 0 is any distance. */
+	public static final int[] WAYPOINT_DISTANCES = {0, 64, 128, 256, 512, 1024, 2048};
 	/** Minimap sizes, in GUI pixels: {@link #MIN_SIZE} to {@link #MAX_SIZE} in steps of {@link #SIZE_STEP}. */
 	public static final int MIN_SIZE = 64;
 	public static final int MAX_SIZE = 224;
 	public static final int SIZE_STEP = 8;
+	/** How much the enlarge key grows the minimap, in percent: {@link #MIN_ENLARGED} to {@link #MAX_ENLARGED} in steps of {@link #ENLARGED_STEP}. */
+	public static final int MIN_ENLARGED = 125;
+	public static final int MAX_ENLARGED = 400;
+	public static final int ENLARGED_STEP = 25;
+	/** Minimap opacity, in percent: {@link #MIN_OPACITY} to {@link #MAX_OPACITY} in steps of {@link #OPACITY_STEP}. */
+	public static final int MIN_OPACITY = 20;
+	public static final int MAX_OPACITY = 100;
+	public static final int OPACITY_STEP = 5;
+
+	public static final String DEFAULT_TELEPORT_COMMAND = "tp @s {x} {y} {z}";
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 	private static Settings current;
@@ -44,15 +57,23 @@ public final class Settings {
 	public boolean minimap = true;
 	/** In GUI pixels. Saved as a number; files from before it was a slider say SMALL, MEDIUM or LARGE. */
 	@JsonAdapter(SizeAdapter.class)
-	public int minimapSize = 128;
+	public int minimapSize = 96;
 	public Corner minimapCorner = Corner.TOP_RIGHT;
+	/** The minimap's size while the enlarge key is held, in percent of {@link #minimapSize}. */
+	public int minimapEnlarged = 200;
 	public int minimapZoom = 3;
+	/** How opaque the minimap's map is, in percent. Files from before this setting leave it at 100. */
+	public int minimapOpacity = MAX_OPACITY;
 	public boolean compass = true;
 	public boolean coordinates = true;
 	public boolean biome = true;
 	public boolean autoCaves = true;
 	public Frame minimapFrame = Frame.CLASSIC;
+	public Shape minimapShape = Shape.SQUARE;
 
+	/** Which maps show the radar at all; what it shows is the same on both. */
+	public boolean radarOnMinimap = true;
+	public boolean radarOnMap = true;
 	public boolean radarPlayers = true;
 	public boolean radarHostile = true;
 	public boolean radarNeutral = true;
@@ -71,7 +92,26 @@ public final class Settings {
 	public boolean waypointsOnMap = true;
 	public boolean waypointsInWorld = true;
 	public boolean deathMarkers = true;
+	/** A pin on the bed the player last slept in ({@link dev.diorama.waypoint.Waypoints#watchSleep}). */
+	public boolean bedMarkers = true;
 	public WaypointLabels waypointLabels = WaypointLabels.AUTO;
+	/**
+	 * Waypoints further than this many blocks away leave the world and the minimap; the map still
+	 * shows them all. 0 shows them at any distance. One of {@link #WAYPOINT_DISTANCES}.
+	 */
+	public int waypointDistance = 0;
+	/** The Waypoints and Settings buttons on the map. A modpack can hide them; their keys still open both. */
+	public boolean mapWaypointsButton = true;
+	public boolean mapSettingsButton = true;
+	/** The Maps button on the map, where each dimension's maps are made and switched. */
+	public boolean mapMapsButton = true;
+	/** Add waypoint and Add temporary waypoint in the map's right-click menu. */
+	public boolean mapAddWaypoints = true;
+	/**
+	 * The command sent to teleport, with {x}, {y} and {z} for the block. Servers that don't let
+	 * players use /tp often have their own teleport command.
+	 */
+	public String teleportCommand = DEFAULT_TELEPORT_COMMAND;
 
 	public boolean outlines = true;
 	public boolean roundedFog = true;
@@ -90,6 +130,25 @@ public final class Settings {
 	public boolean chunkGrid = false;
 	public boolean slimeChunks = false;
 	public SpawnSpots spawnSpots = SpawnSpots.OFF;
+	/** Where FTB Chunks' land claims show, when it's installed. */
+	public ClaimsShown claims = ClaimsShown.ALWAYS;
+
+	/** Where land claims show: nowhere, on the fullscreen map, or on the minimap too. */
+	public enum ClaimsShown {
+		OFF,
+		FULLSCREEN,
+		ALWAYS
+	}
+
+	/** Where the player's drawings show. Notes stay off the minimap, where they'd cover it. */
+	public DrawingsShown drawings = DrawingsShown.ALWAYS;
+
+	/** Where drawings show: nowhere but draw mode, on the fullscreen map, or on the minimap too. */
+	public enum DrawingsShown {
+		OFF,
+		FULLSCREEN,
+		ALWAYS
+	}
 
 	public enum Quality {
 		FANCY,
@@ -101,6 +160,12 @@ public final class Settings {
 		CLASSIC,
 		MINECRAFT,
 		NONE
+	}
+
+	/** The minimap's outline: a square, or a circle like other minimap mods offer. */
+	public enum Shape {
+		SQUARE,
+		ROUND
 	}
 
 	public enum RadarStyle {
@@ -167,6 +232,11 @@ public final class Settings {
 		return ZOOMS[Math.max(0, Math.min(ZOOMS.length - 1, this.minimapZoom))];
 	}
 
+	/** How opaque the minimap's map is, 0 to 1. */
+	public float opacity() {
+		return snapOpacity(this.minimapOpacity) / 100.0F;
+	}
+
 	/** The map look these settings ask for. */
 	public MapStyle style() {
 		return MapStyle.DEFAULT.withName("Settings")
@@ -230,6 +300,9 @@ public final class Settings {
 		if (settings.minimapFrame == null) {
 			settings.minimapFrame = Frame.CLASSIC;
 		}
+		if (settings.minimapShape == null) {
+			settings.minimapShape = Shape.SQUARE;
+		}
 		if (settings.radarStyle == null) {
 			settings.radarStyle = RadarStyle.HEADS;
 		}
@@ -237,28 +310,67 @@ public final class Settings {
 		if (settings.playerNames == null) {
 			settings.playerNames = NameTags.FULLSCREEN;
 		}
+		if (settings.claims == null) {
+			settings.claims = ClaimsShown.ALWAYS;
+		}
+		if (settings.drawings == null) {
+			settings.drawings = DrawingsShown.ALWAYS;
+		}
 		if (settings.waypointLabels == null) {
 			settings.waypointLabels = WaypointLabels.AUTO;
 		}
+		settings.teleportCommand = cleanCommand(settings.teleportCommand);
 		settings.arrowColor = Math.floorMod(settings.arrowColor, ARROW_COLORS.length);
 		// Hand-edited numbers: snap to a value the settings screen can show.
 		settings.minimapZoom = Math.max(0, Math.min(ZOOMS.length - 1, settings.minimapZoom));
 		settings.minimapSize = snapSize(settings.minimapSize);
-		int nearest = RANGES[0];
-		for (int range : RANGES) {
-			if (Math.abs(range - settings.radarRange) < Math.abs(nearest - settings.radarRange)) {
-				nearest = range;
-			}
-		}
-		settings.radarRange = nearest;
+		settings.minimapOpacity = snapOpacity(settings.minimapOpacity);
+		settings.minimapEnlarged = snapEnlarged(settings.minimapEnlarged);
+		settings.radarRange = nearest(RANGES, settings.radarRange);
+		settings.waypointDistance = nearest(WAYPOINT_DISTANCES, settings.waypointDistance);
 		settings.apply();
 		return settings;
+	}
+
+	/**
+	 * A typed teleport command without its slash, or the default for a blank one. Runs of spaces
+	 * become one, as chat does before sending a command: the server's parser wants just one.
+	 */
+	public static String cleanCommand(@Nullable String command) {
+		String trimmed = command == null ? "" : command.trim().replaceAll("\\s+", " ");
+		while (trimmed.startsWith("/")) {
+			trimmed = trimmed.substring(1).trim();
+		}
+		return trimmed.isEmpty() ? DEFAULT_TELEPORT_COMMAND : trimmed;
+	}
+
+	/** The value in {@code steps} nearest to {@code value}. */
+	private static int nearest(int[] steps, int value) {
+		int nearest = steps[0];
+		for (int step : steps) {
+			if (Math.abs((long) step - value) < Math.abs((long) nearest - value)) {
+				nearest = step;
+			}
+		}
+		return nearest;
 	}
 
 	/** The nearest size the settings screen can show. */
 	public static int snapSize(int size) {
 		int clamped = Math.max(MIN_SIZE, Math.min(MAX_SIZE, size));
 		return MIN_SIZE + Math.round((clamped - MIN_SIZE) / (float) SIZE_STEP) * SIZE_STEP;
+	}
+
+	/** The nearest enlarged size the settings screen can show. */
+	public static int snapEnlarged(int percent) {
+		int clamped = Math.max(MIN_ENLARGED, Math.min(MAX_ENLARGED, percent));
+		return MIN_ENLARGED + Math.round((clamped - MIN_ENLARGED) / (float) ENLARGED_STEP) * ENLARGED_STEP;
+	}
+
+	/** The nearest opacity the settings screen can show. */
+	public static int snapOpacity(int opacity) {
+		int clamped = Math.max(MIN_OPACITY, Math.min(MAX_OPACITY, opacity));
+		return MIN_OPACITY + Math.round((clamped - MIN_OPACITY) / (float) OPACITY_STEP) * OPACITY_STEP;
 	}
 
 	/** Reads the minimap size as a number, or as the Small, Medium and Large it was before. */

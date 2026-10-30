@@ -1,19 +1,21 @@
 package dev.diorama.render;
 
+import dev.diorama.Claims;
 import dev.diorama.Diorama;
 import dev.diorama.Projection;
 import dev.diorama.bake.BlockLooks;
 import dev.diorama.bake.ChunkSource;
 import dev.diorama.bake.Overlays;
-import dev.diorama.bake.MapPick;
+import dev.diorama.bake.PinnedSource;
 import dev.diorama.bake.TileBaker;
 import dev.diorama.bake.TileImage;
 import dev.diorama.bake.TileKey;
+import dev.diorama.bake.TileSpots;
 import dev.diorama.data.ChunkSnapshot;
 import dev.diorama.data.SeenBlocks;
 import dev.diorama.data.TileStore;
-import dev.diorama.data.MapLocations;
-import net.minecraft.core.BlockPos;
+import dev.diorama.data.WorldSavePick;
+import dev.diorama.render.gpu.MapTexture;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -24,11 +26,13 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.core.BlockPos;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -67,6 +71,7 @@ public final class MapLevel implements ChunkSource {
 	});
 
 	private final int minY;
+	private boolean savedOnly;
 	private final int maxY;
 	private final ConcurrentHashMap<Long, ChunkSnapshot> chunks = new ConcurrentHashMap<>();
 	private volatile int topY = Integer.MIN_VALUE;
@@ -123,6 +128,18 @@ public final class MapLevel implements ChunkSource {
 	private int playerChunkZ;
 	private long frame;
 	private volatile boolean closed;
+	/** Tiles whose claims are being painted. */
+	private final Set<TileKey> claimsInFlight = new HashSet<>();
+	private final ConcurrentLinkedQueue<PaintedClaims> paintedClaims = new ConcurrentLinkedQueue<>();
+
+	/** Claims painted for a tile, on its pixels as they were at {@code revision}. */
+	private record PaintedClaims(TileKey key, MapTile tile, Claims.Snapshot claims, int revision, int @Nullable [] pixels) {
+	}
+
+	/** At most this many tiles' claims are painted at once, beside the bakes. */
+	private static final int CLAIM_PAINTS = 2;
+	/** A tile whose pixels changed has its claims painted again at most this often. */
+	private static final long CLAIM_REPAINT_MS = 2000;
 
 	/** See {@link ChunkSource#roof()}. */
 	private final int roof;
@@ -134,6 +151,13 @@ public final class MapLevel implements ChunkSource {
 		this.folder = folder;
 		this.store = this.openStore();
 		this.seen = folder == null ? new SeenBlocks() : SeenBlocks.load(folder.resolve("seen.bin"));
+	}
+
+	/** Reads archived terrain without baking, changing saved pixels, or accessing live chunks. */
+	public static MapLevel openSaved(int minY, int maxY, int roof, Path folder) {
+		MapLevel map = new MapLevel(minY, maxY, roof, folder);
+		map.savedOnly = true;
+		return map;
 	}
 
 	@Override
@@ -525,41 +549,9 @@ public final class MapLevel implements ChunkSource {
 		return this.store != null;
 	}
 
-	/** Live terrain first, then saved coordinates; old image-only maps still allow approximate pins. */
-	public MapLocations.@Nullable Location pick(BlockLooks looks, double u, double v, int layer, int fallbackY) {
-		BlockPos live = MapPick.standingSpot(this, looks, u, v, layer, this.fogOfWar);
-		if (live != null) {
-			return new MapLocations.Location(live, MapPick.biomeAt(this, live), false);
-		}
-		if (layer != TileKey.SURFACE) {
-			return null;
-		}
-		TileKey key = new TileKey(layer, (int) Math.floor(u / Projection.TILE_UNITS), (int) Math.floor(v / Projection.TILE_UNITS));
-		MapLocations saved = this.store == null ? null : this.store.locations(key);
-		MapLocations.Location location = saved == null ? null : saved.at(u, v);
-		if (location != null) {
-			return location;
-		}
-		// Old .omt files only contain an image. Do not invent its biome or ground height.
-		// Keep waypoint creation available and mark its position as approximate in the UI.
-		if (!this.mapped(u, v, layer)) {
-			return null;
-		}
-		return new MapLocations.Location(BlockPos.containing(u, fallbackY, (v + fallbackY * Projection.cos()) / Projection.sin()), null, true);
-	}
-
-	private boolean mapped(double u, double v, int layer) {
-		for (int lod = 0; lod <= TileKey.MAX_LOD; lod++) {
-			double units = (double) Projection.TILE_UNITS * (1 << lod);
-			int tu = (int) Math.floor(u / units);
-			int tv = (int) Math.floor(v / units);
-			MapTile tile = this.tiles.get(new TileKey(layer, tu, tv, lod));
-			if (tile != null && tile.coverage((int) ((u / units - tu) * Projection.COVERAGE_CELLS),
-				(int) ((v / units - tv) * Projection.COVERAGE_CELLS)) > 0) {
-				return true;
-			}
-		}
-		return false;
+	/** The saved sky view, or null when nothing is saved. Render thread. */
+	public @Nullable TileStore savedMap() {
+		return this.store;
 	}
 
 	/** Uploads finished bakes and starts new ones. Call regularly on the render thread. */
@@ -600,11 +592,12 @@ public final class MapLevel implements ChunkSource {
 				// Baked only to be saved; a map that wants it will bake it again.
 				if (this.store != null) {
 					this.store.baked(image);
+					this.pixelsMoved(image.key());
 				}
 				continue;
 			}
 			if (tile == null) {
-				if (image.key().lod() > 0 && !image.isFull()) {
+				if ((image.key().lod() > 0 || this.savedOnly) && !image.isFull()) {
 					if (!this.dirty.containsKey(image.key())) {
 						this.emptyOverviews.add(image.key());
 					}
@@ -617,9 +610,18 @@ public final class MapLevel implements ChunkSource {
 				this.tiles.put(image.key(), tile);
 			}
 			tile.upload(image);
+			this.pixelsMoved(image.key());
 			this.coverageVersion++;
-			if (this.store != null && !image.key().isCave() && image.key().lod() == 0) {
+			if (!this.savedOnly && this.store != null && !image.key().isCave() && image.key().lod() == 0) {
 				this.store.baked(image);
+			}
+		}
+		PaintedClaims painted;
+		while ((painted = this.paintedClaims.poll()) != null) {
+			this.claimsInFlight.remove(painted.key());
+			// Not for a tile evicted meanwhile, nor one put in its place.
+			if (this.tiles.get(painted.key()) == painted.tile() && !this.closed) {
+				painted.tile().paintClaims(painted.pixels(), painted.claims(), painted.revision());
 			}
 		}
 		if (this.trimStuck && System.currentTimeMillis() - this.lastTrimMs >= TRIM_RETRY_MS) {
@@ -627,7 +629,7 @@ public final class MapLevel implements ChunkSource {
 		}
 
 		BlockLooks looks = BlockLooks.get();
-		if (looks != null && (this.topY != Integer.MIN_VALUE || this.store != null)) {
+		if (this.savedOnly || looks != null && this.topY != Integer.MIN_VALUE) {
 			long now = System.currentTimeMillis();
 			int limit = 6;
 			List<Map.Entry<TileKey, Double>> order = new ArrayList<>(this.wanted.entrySet());
@@ -644,7 +646,7 @@ public final class MapLevel implements ChunkSource {
 					continue;
 				}
 				boolean missing = !this.tiles.containsKey(key);
-				if (key.lod() > 0) {
+				if (key.lod() > 0 || this.savedOnly) {
 					// Overview tiles come from disk, shrunk from saved tiles; nothing to bake.
 					if ((missing || this.dirty.containsKey(key)) && this.store != null && !this.emptyOverviews.contains(key)) {
 						this.dirty.remove(key);
@@ -660,7 +662,9 @@ public final class MapLevel implements ChunkSource {
 					this.bake(key, looks, missing || d.blocks.cardinality() > 160 ? null : d.blocks);
 				}
 			}
-			this.bakeUnsaved(looks, now);
+			if (!this.savedOnly) {
+				this.bakeUnsaved(looks, now);
+			}
 		}
 		this.wanted.clear();
 		this.evict();
@@ -707,11 +711,7 @@ public final class MapLevel implements ChunkSource {
 		// changes those two.
 		int view = this.roof() != dev.diorama.bake.ChunkSource.NO_ROOF ? dev.diorama.render.gpu.GpuBakeCheck.UNDER_ROOF
 			: key.isCave() ? dev.diorama.render.gpu.GpuBakeCheck.CAVE : dev.diorama.render.gpu.GpuBakeCheck.SKY;
-		// An image-only saved map has no geometry to mesh (or even a valid top height).
-		// The CPU path simply reads its pixels and leaves its missing locations unknown.
-		dev.diorama.render.gpu.GpuBakeCheck.Mode gpu = this.topY == Integer.MIN_VALUE
-			? dev.diorama.render.gpu.GpuBakeCheck.Mode.TRACE
-			: dev.diorama.render.gpu.GpuBakeCheck.mode(view, view != dev.diorama.render.gpu.GpuBakeCheck.SKY && fog, overlays != null);
+		dev.diorama.render.gpu.GpuBakeCheck.Mode gpu = dev.diorama.render.gpu.GpuBakeCheck.mode(view, view != dev.diorama.render.gpu.GpuBakeCheck.SKY && fog, overlays != null);
 		if (gpu == dev.diorama.render.gpu.GpuBakeCheck.Mode.GPU) {
 			this.bakeOnGpu(key, looks, generation, fog, overlays, store);
 			return;
@@ -724,8 +724,11 @@ public final class MapLevel implements ChunkSource {
 			try {
 				long start = System.nanoTime();
 				int[] saved = store == null ? null : store.read(key);
-				this.finished.add(TileBaker.bake(key, this, looks, blocks, fog, saved, overlays).withGeneration(generation));
-				logBakeTime(System.nanoTime() - start, blocks == null);
+				ChunkSource source = this.sourceFor(store);
+				TileImage image = TileBaker.bake(key, source, looks, blocks, fog, saved, overlays);
+				long spots = System.nanoTime();
+				this.finished.add(this.withSpots(image, source, looks, fog, store).withGeneration(generation));
+				logBakeTime(System.nanoTime() - start, System.nanoTime() - spots, blocks == null);
 			} catch (Throwable t) {
 				Diorama.LOGGER.error("Failed to bake tile {}", key, t);
 				this.finished.add(TileImage.partial(key, List.of()).withGeneration(generation));
@@ -742,15 +745,14 @@ public final class MapLevel implements ChunkSource {
 		BAKERS.execute(() -> {
 			try {
 				int[] saved = store == null ? null : store.read(key);
-				dev.diorama.bake.ChunkSource source = fog ? this : new dev.diorama.bake.PinnedSource(this);
+				ChunkSource source = this.sourceFor(store);
 				dev.diorama.bake.GpuMesher.Mesh mesh = dev.diorama.bake.GpuMesher.build(key, source, looks, fog, overlays);
-				MapLocations locations = MapPick.locations(key, source, looks, fog, null);
 				dev.diorama.render.gpu.GpuTileBaker.submit(mesh, result -> BAKERS.execute(() -> {
 					try {
 						TileImage image = result.pixels() == null
 							? TileBaker.bake(key, source, looks, null, fog, saved, overlays)
-							: TileBaker.gpuImage(key, result.pixels(), saved, result.info()).withLocations(locations);
-						this.finished.add(image.withGeneration(generation));
+							: TileBaker.gpuImage(key, result.pixels(), saved, result.info());
+						this.finished.add(this.withSpots(image, source, looks, fog, store).withGeneration(generation));
 					} catch (Throwable t) {
 						Diorama.LOGGER.error("Failed to finish GPU tile {}", key, t);
 						this.finished.add(TileImage.partial(key, List.of()).withGeneration(generation));
@@ -803,6 +805,208 @@ public final class MapLevel implements ChunkSource {
 		});
 	}
 
+	/**
+	 * What a bake reads chunks from. A tile to be saved gets its {@link TileSpots} too, in a second
+	 * pass, and both passes have to see the same chunks, or a block changed in between would save
+	 * pixels showing it with spots that don't.
+	 */
+	private ChunkSource sourceFor(@Nullable TileStore store) {
+		return store == null ? this : new PinnedSource(this);
+	}
+
+	/**
+	 * A bake of a tile to be saved, with its {@link TileSpots} worked out from the chunks the bake
+	 * read, so the right-click menu still works there once they're gone. Baker threads.
+	 */
+	private TileImage withSpots(TileImage image, ChunkSource source, BlockLooks looks, boolean fog, @Nullable TileStore store) {
+		if (store == null) {
+			return image;
+		}
+		return image.withSpots(TileSpots.pick(image, source, looks, fog, store.spots(image.key())));
+	}
+
+	/**
+	 * What the map knows of a point: where a player would stand there, or null for nowhere.
+	 * {@code unsaved} when the map shows something there but doesn't know where its ground is.
+	 */
+	public record Spot(@Nullable BlockPos pos, boolean unsaved) {
+		public static final Spot NOTHING = new Spot(null, false);
+	}
+
+	/**
+	 * Where a player would stand at a map point by the spots saved with its tile, for where the
+	 * chunks are gone. Reads the disk off the render thread.
+	 *
+	 * <p>A tile saved before tiles kept their spots (Diorama 0.3.0 and older) has none. Where it
+	 * shows something, {@code readWorld} works the spot out from the world's chunks in
+	 * singleplayer; elsewhere, or where the save has nothing either, the answer is {@code unsaved}.
+	 */
+	public CompletableFuture<Spot> savedSpot(int layer, double u, double v, BlockLooks looks, boolean readWorld) {
+		TileStore store = this.store;
+		if (store == null || layer != TileKey.SURFACE) {
+			return CompletableFuture.completedFuture(Spot.NOTHING);
+		}
+		TileKey key = new TileKey(layer, (int) Math.floor(u / Projection.TILE_UNITS), (int) Math.floor(v / Projection.TILE_UNITS));
+		WorldSavePick world = readWorld ? WorldSavePick.current() : null;
+		boolean fog = this.fogOfWar;
+		return CompletableFuture.supplyAsync(() -> {
+			int[] spots = store.spots(key);
+			if (TileSpots.known(key, spots, u, v)) {
+				return CompletableFuture.completedFuture(new Spot(TileSpots.spot(key, spots, u, v), false));
+			}
+			var legacy = store.legacyLocation(key, u, v);
+			if (legacy != null) {
+				return CompletableFuture.completedFuture(new Spot(legacy.position(), false));
+			}
+			if (!drawn(store.read(key), key, u, v)) {
+				return CompletableFuture.completedFuture(Spot.NOTHING);
+			}
+			if (world == null) {
+				return CompletableFuture.completedFuture(new Spot(null, true));
+			}
+			// Nothing found in the save, where the map shows something: say to come back, not that nothing's there.
+			return world.pick(this, looks, u, v, fog).thenApply(pos -> new Spot(pos, pos == null));
+		}).thenCompose(spot -> spot).exceptionally(t -> {
+			Diorama.LOGGER.warn("Couldn't read the saved spots of tile {}", key, t);
+			return Spot.NOTHING;
+		});
+	}
+
+	/** Whether a saved tile shows anything at map point {@code (u, v)}. */
+	private static boolean drawn(int @Nullable [] pixels, TileKey key, double u, double v) {
+		if (pixels == null) {
+			return false;
+		}
+		int size = Projection.TILE_PIXELS;
+		int x = (int) Math.max(0L, Math.min(size - 1L, (long) Math.floor((u - key.minU()) * Projection.PIXELS_PER_UNIT)));
+		int y = (int) Math.max(0L, Math.min(size - 1L, (long) Math.floor((v - key.minV()) * Projection.PIXELS_PER_UNIT)));
+		return (pixels[y * size + x] >>> 24) != 0;
+	}
+
+	/**
+	 * The land claims to draw over a tile, or null for none. Asks for them to be painted, off the
+	 * render thread, when the claims under the tile changed or the tile did; the old ones show
+	 * meanwhile. Only the saved sky view knows which chunk each pixel shows.
+	 */
+	public @Nullable MapTexture claims(TileKey key, MapTile tile) {
+		TileStore store = this.store;
+		if (store == null || key.isCave()) {
+			return null;
+		}
+		Claims.Snapshot claims = Claims.get();
+		Claims.Snapshot painted = tile.claimsPainted;
+		boolean moved = tile.claimsRevision != tile.pixelsRevision;
+		if (painted == claims && !moved) {
+			return tile.claims();
+		}
+		// The chunks the tile could show, and the columns past its sides that its edges look at:
+		// its columns, and the rows' ground anywhere from the bottom of the world to the top.
+		int cx0 = Math.floorDiv((int) Math.floor(key.minU()), 16) - 1;
+		int cx1 = Math.floorDiv((int) Math.ceil(key.minU() + key.units()), 16) + 1;
+		int cz0 = Math.floorDiv((int) Math.floor(Projection.zAt(key.minV(), this.minY)), 16);
+		int cz1 = Math.floorDiv((int) Math.ceil(Projection.zAt(key.minV() + key.units(), this.maxY)), 16);
+		boolean near = claims.mayHaveAny(cx0, cz0, cx1, cz1);
+		boolean changed = painted == null ? near : claims.differsIn(painted, cx0, cz0, cx1, cz1);
+		if (!changed && !(moved && near)) {
+			// Nothing claimed under this tile changed, and its pixels didn't, or nothing is claimed near it.
+			if (painted == null) {
+				tile.paintClaims(null, claims, tile.pixelsRevision);
+			} else {
+				tile.claimsPainted = claims;
+				if (!near) {
+					tile.claimsRevision = tile.pixelsRevision;
+				}
+			}
+			return tile.claims();
+		}
+		// New claims at once; moved pixels after a pause, as a tile in view can change every few ticks.
+		boolean due = changed || System.currentTimeMillis() - tile.pixelsChanged > CLAIM_REPAINT_MS;
+		if (due && !this.claimsInFlight.contains(key) && this.claimsInFlight.size() < CLAIM_PAINTS) {
+			this.claimsInFlight.add(key);
+			int revision = tile.pixelsRevision;
+			BAKERS.execute(() -> {
+				int[] pixels = null;
+				try {
+					pixels = this.paintClaims(store, key, claims);
+				} catch (Throwable t) {
+					Diorama.LOGGER.error("Failed to paint the claims on tile {}", key, t);
+				}
+				this.paintedClaims.add(new PaintedClaims(key, tile, claims, revision, pixels));
+			});
+		}
+		return tile.claims();
+	}
+
+	/**
+	 * A tile's pixels changed, so may the ground its claims are painted on, and the edge rows the
+	 * tiles above and below it paint their own edges against.
+	 */
+	private void pixelsMoved(TileKey key) {
+		long now = System.currentTimeMillis();
+		for (int dv = -1; dv <= 1; dv++) {
+			MapTile tile = this.tiles.get(new TileKey(key.layer(), key.tileU(), key.tileV() + dv, key.lod()));
+			if (tile != null) {
+				// The repaint waits from the first change it hasn't painted, so a tile changing all
+				// the time still gets one.
+				if (tile.claimsRevision == tile.pixelsRevision) {
+					tile.pixelsChanged = now;
+				}
+				tile.pixelsRevision++;
+			}
+		}
+	}
+
+	/**
+	 * For tests: makes the overview tiles from level 1 up to {@code key} over its area look saved
+	 * before chunks were kept, and reloads {@code key}. Not on the render thread.
+	 */
+	public void forgetChunks(TileKey key) {
+		TileStore store = this.store;
+		if (store == null) {
+			return;
+		}
+		for (int lod = 1; lod <= key.lod(); lod++) {
+			int span = 1 << (key.lod() - lod);
+			for (int du = 0; du < span; du++) {
+				for (int dv = 0; dv < span; dv++) {
+					store.forgetChunks(new TileKey(key.layer(), key.tileU() * span + du, key.tileV() * span + dv, lod));
+				}
+			}
+		}
+		this.overviewChanged.add(key);
+	}
+
+	/** For tests: makes a level-0 tile look saved before tiles kept their spots, on disk too. Not on the render thread. */
+	public void forgetSpots(TileKey key) {
+		TileStore store = this.store;
+		if (store != null) {
+			store.forgetSpots(key);
+		}
+	}
+
+	/** For tests: whether a level-0 tile has spots saved. Not on the render thread. */
+	public boolean hasSavedSpots(TileKey key) {
+		TileStore store = this.store;
+		return store != null && store.spots(key) != null;
+	}
+
+	/** For tests: the claims a tile shows by the current claims, painted on this thread; null for none. */
+	public int @Nullable [] claimPixels(TileKey key) {
+		TileStore store = this.store;
+		return store == null ? null : this.paintClaims(store, key, Claims.get());
+	}
+
+	/** A tile's claims, with its edge rows told apart from the tiles above and below it. Not on the render thread. */
+	private int @Nullable [] paintClaims(TileStore store, TileKey key, Claims.Snapshot claims) {
+		byte[] chunks = store.chunks(key);
+		if (chunks == null) {
+			return null;
+		}
+		TileKey north = new TileKey(key.layer(), key.tileU(), key.tileV() - 1, key.lod());
+		TileKey south = new TileKey(key.layer(), key.tileU(), key.tileV() + 1, key.lod());
+		return ClaimPaint.paint(key, chunks, store.chunks(north), store.chunks(south), claims);
+	}
+
 	private void loadOverview(TileKey key, TileStore store) {
 		this.inFlight.add(key);
 		int generation = this.generation(key);
@@ -844,10 +1048,12 @@ public final class MapLevel implements ChunkSource {
 
 	private static final java.util.concurrent.atomic.AtomicLong BAKE_NANOS = new java.util.concurrent.atomic.AtomicLong();
 	private static final AtomicInteger BAKE_COUNT = new AtomicInteger();
+	/** The part of {@link #BAKE_NANOS} spent in {@link #withSpots}. */
+	private static final java.util.concurrent.atomic.AtomicLong SPOT_NANOS = new java.util.concurrent.atomic.AtomicLong();
 
 	private static final AtomicInteger PARTIAL_COUNT = new AtomicInteger();
 
-	private static void logBakeTime(long nanos, boolean full) {
+	private static void logBakeTime(long nanos, long spotNanos, boolean full) {
 		if (!full) {
 			if (PARTIAL_COUNT.incrementAndGet() % 50 == 0) {
 				Diorama.LOGGER.info("Re-baked {} partial tiles", PARTIAL_COUNT.get());
@@ -855,9 +1061,10 @@ public final class MapLevel implements ChunkSource {
 			return;
 		}
 		long total = BAKE_NANOS.addAndGet(nanos);
+		long spots = SPOT_NANOS.addAndGet(spotNanos);
 		int count = BAKE_COUNT.incrementAndGet();
 		if (count % 25 == 0) {
-			Diorama.LOGGER.info("Baked {} full tiles, {} ms average", count, total / count / 1_000_000);
+			Diorama.LOGGER.info("Baked {} full tiles, {} ms average, {} ms of it finding spots", count, total / count / 1_000_000, spots / count / 1_000_000);
 		}
 	}
 
@@ -904,7 +1111,7 @@ public final class MapLevel implements ChunkSource {
 		if (this.closed) {
 			return;
 		}
-		if (this.store != null) {
+		if (this.store != null && !this.savedOnly) {
 			this.saveLastBakes(this.store);
 		}
 		this.closed = true;

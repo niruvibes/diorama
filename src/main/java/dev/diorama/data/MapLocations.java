@@ -15,7 +15,7 @@ import java.util.zip.InflaterInputStream;
 import net.minecraft.core.BlockPos;
 import org.jspecify.annotations.Nullable;
 
-/** Terrain coordinates and biome IDs alongside a saved tile, at one sample per map unit. */
+/** Legacy fork coordinates and biome IDs, retained for compatibility with existing saved tiles. */
 public final class MapLocations {
 	private static final int MAGIC = 0x4F4D5031;
 	private static final int SIZE = Projection.TILE_UNITS;

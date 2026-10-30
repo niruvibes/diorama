@@ -3,6 +3,7 @@ package dev.diorama.data;
 import dev.diorama.mixin.BiomeManagerAccessor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.SectionPos;
 import net.minecraft.core.registries.Registries;
@@ -10,6 +11,7 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.DataLayer;
@@ -62,6 +64,8 @@ public final class ChunkSnapshot {
 	public final int maxY;
 	/** A conservative low point of the visible surface, used to bound tile invalidation. */
 	public final int floorY;
+	/** Per section, the filled copycats in it; null when the chunk has none, as nearly every chunk. */
+	private final @Nullable SectionCopycats @Nullable [] copycats;
 
 	@SuppressWarnings("unchecked")
 	private ChunkSnapshot(LevelChunk chunk, ClientLevel level) {
@@ -128,6 +132,125 @@ public final class ChunkSnapshot {
 		this.maxY = top <= chunk.getMinY() ? Integer.MIN_VALUE : top;
 		// Water and shallow overhangs can hide blocks below the motion-blocking height.
 		this.floorY = floor == Integer.MAX_VALUE ? chunk.getMinY() : floor - 24;
+		this.copycats = Copycats.INSTALLED ? copycats(chunk, sections.length) : null;
+	}
+
+	/**
+	 * Just the blocks of a chunk from the singleplayer server, for {@link WorldSavePick}: no light,
+	 * biomes or copycats, so nothing to draw with. A chunk the world never finished generating
+	 * reads as empty, as the client never had it.
+	 */
+	@SuppressWarnings("unchecked")
+	private ChunkSnapshot(ChunkAccess chunk, ClientLevel level, boolean full) {
+		this.chunkX = chunk.getPos().x();
+		this.chunkZ = chunk.getPos().z();
+		this.minSectionY = chunk.getMinSectionY();
+		LevelChunkSection[] sections = chunk.getSections();
+		this.states = new PalettedContainer[sections.length];
+		this.uniform = new BlockState[sections.length];
+		for (int i = 0; full && i < sections.length; i++) {
+			LevelChunkSection section = sections[i];
+			if (section != null && !section.hasOnlyAir()) {
+				PalettedContainer<BlockState> states = section.getStates();
+				BlockState single = Sections.singleValue(states);
+				if (single != null) {
+					this.uniform[i] = single;
+				} else {
+					this.states[i] = states.copy();
+				}
+			}
+		}
+		this.biomes = new PalettedContainerRO[9][];
+		this.biomeZoomSeed = 0;
+		this.blendRadius = 0;
+		this.fallbackBiome = level.registryAccess().lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.PLAINS);
+		this.hasSkyLight = false;
+		this.blockLight = new DataLayer[sections.length];
+		this.skyLight = new DataLayer[sections.length];
+		int top = Integer.MIN_VALUE;
+		for (int z = 0; full && z < 16; z++) {
+			for (int x = 0; x < 16; x++) {
+				int surface = chunk.getHeight(Heightmap.Types.WORLD_SURFACE, x, z);
+				top = Math.max(top, surface);
+				this.surface[(z << 4) | x] = surface;
+			}
+		}
+		this.maxY = top <= chunk.getMinY() ? Integer.MIN_VALUE : top;
+		this.floorY = chunk.getMinY();
+		this.copycats = null;
+	}
+
+	/**
+	 * The blocks of a chunk the singleplayer server read from the world's save; see the
+	 * constructor. Call on the server thread.
+	 */
+	public static ChunkSnapshot fromServer(ChunkAccess chunk, ClientLevel level) {
+		return new ChunkSnapshot(chunk, level, chunk.getPersistedStatus().isOrAfter(ChunkStatus.FULL));
+	}
+
+	/** What the chunk's copycats are filled with, by section, or null if none are filled. */
+	@SuppressWarnings("unchecked")
+	private static @Nullable SectionCopycats @Nullable [] copycats(LevelChunk chunk, int sectionCount) {
+		java.util.List<Integer>[] at = null;
+		java.util.List<BlockState>[] materials = null;
+		for (BlockEntity entity : chunk.getBlockEntities().values()) {
+			BlockState material = Copycats.material(entity);
+			if (material == null) {
+				continue;
+			}
+			BlockPos pos = entity.getBlockPos();
+			int section = (pos.getY() >> 4) - chunk.getMinSectionY();
+			if (section < 0 || section >= sectionCount) {
+				continue;
+			}
+			if (at == null) {
+				at = new java.util.List[sectionCount];
+				materials = new java.util.List[sectionCount];
+			}
+			if (at[section] == null) {
+				at[section] = new java.util.ArrayList<>();
+				materials[section] = new java.util.ArrayList<>();
+			}
+			at[section].add(((pos.getY() & 15) << 8) | ((pos.getZ() & 15) << 4) | (pos.getX() & 15));
+			materials[section].add(material);
+		}
+		if (at == null) {
+			return null;
+		}
+		SectionCopycats[] out = new SectionCopycats[sectionCount];
+		for (int i = 0; i < sectionCount; i++) {
+			if (at[i] != null) {
+				out[i] = new SectionCopycats(at[i].stream().mapToInt(Integer::intValue).toArray(), materials[i].toArray(new BlockState[0]));
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * The filled copycats in one section: where each is, indexed {@code (y << 8) | (z << 4) | x}
+	 * like the section's ids, and the block it's filled with.
+	 */
+	public record SectionCopycats(int[] at, BlockState[] material) {
+	}
+
+	/** The filled copycats in a section, or null if it has none. */
+	public @Nullable SectionCopycats copycats(int index) {
+		return this.copycats == null ? null : this.copycats[index];
+	}
+
+	/** What the copycat at this position in the chunk was filled with, or null if there's none filled. */
+	public @Nullable BlockState copycatMaterial(int x, int y, int z) {
+		int section = (y >> 4) - this.minSectionY;
+		SectionCopycats in = this.copycats == null || section < 0 || section >= this.copycats.length ? null : this.copycats[section];
+		if (in != null) {
+			int at = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+			for (int i = 0; i < in.at.length; i++) {
+				if (in.at[i] == at) {
+					return in.material[i];
+				}
+			}
+		}
+		return null;
 	}
 
 	public static ChunkSnapshot take(LevelChunk chunk, ClientLevel level) {

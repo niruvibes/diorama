@@ -4,19 +4,19 @@ import com.mojang.realmsclient.dto.RealmsServer;
 import dev.diorama.WorldKey;
 import net.minecraft.client.multiplayer.ServerData;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-/** Keeps the permanent Realm identity with its server entry, before the temporary IP is used. */
+/**
+ * Notes which realm a connection's server entry is for. The entry only has the address the realm
+ * is running at, and a realm that went to sleep wakes up at another one.
+ */
 @Mixin(RealmsServer.class)
 public abstract class RealmsServerMixin {
-	@Shadow public long id;
-	@Shadow public int activeSlot;
-
 	@Inject(method = "toServerData", at = @At("RETURN"))
-	private void diorama$realmIdentity(String address, CallbackInfoReturnable<ServerData> ci) {
-		WorldKey.realm(ci.getReturnValue(), this.id, this.activeSlot);
+	private void diorama$noteRealm(String ip, CallbackInfoReturnable<ServerData> cir) {
+		RealmsServer realm = (RealmsServer) (Object) this;
+		WorldKey.realmEntry(cir.getReturnValue(), realm.id, realm.activeSlot);
 	}
 }

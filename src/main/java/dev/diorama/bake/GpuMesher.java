@@ -57,6 +57,8 @@ public final class GpuMesher {
 	/** The section table's entries for sections without solid bits: a missing chunk, or nothing solid. */
 	public static final int SECTION_UNKNOWN = 0xFFFFFFFE;
 	public static final int SECTION_EMPTY = 0xFFFFFFFF;
+	/** On a section's table entry: 128 more words follow its solid bits, marking the smaller blocks. */
+	public static final int SECTION_PARTIAL = 0x80000000;
 
 	private GpuMesher() {
 	}
@@ -171,10 +173,12 @@ public final class GpuMesher {
 		public int casterY0;
 		public int casterY1;
 		/**
-		 * The solid blocks around the camera's faces, for sky occlusion on the GPU: a table of
-		 * {@code voxelSize[0] * [1] * [2]} sections (x fastest, then z, then y) holding each one's
-		 * offset into the same array or a {@code SECTION_*} value, then 128 words of solid bits
-		 * per section that has any. Null in lit views, which don't use sky occlusion.
+		 * The solid blocks around the camera's faces, for sky occlusion and shadow walks on the GPU:
+		 * a table of {@code voxelSize[0] * [1] * [2]} sections (x fastest, then z, then y) holding
+		 * each one's offset into the same array or a {@code SECTION_*} value, then 128 words of solid
+		 * bits per section that has any. Where an offset carries {@link #SECTION_PARTIAL}, 128 more
+		 * words follow marking which of those blocks are smaller than a cube. Null in lit views,
+		 * which don't use sky occlusion.
 		 */
 		public int[] voxels;
 		public int voxelCount;
@@ -367,7 +371,7 @@ public final class GpuMesher {
 						}
 					} else if (shape != 0) {
 						ShapeFaces sh = ShapeFaces.of(looks.shapes[shape]);
-						int wet = looks.wetShapes.get(id);
+						int wet = looks.wetShape[id];
 						boolean passes = false;
 						boolean reached;
 						boolean traced = false;
@@ -667,7 +671,7 @@ public final class GpuMesher {
 	/** Whether the cell holds water, as water or waterlogged. */
 	private static boolean wet(VoxelReader reader, BlockLooks looks, int x, int y, int z) {
 		int id = reader.state(x, y, z);
-		return id != VoxelReader.UNKNOWN && (looks.kind[id] == BlockLooks.WATER || looks.wetShapes.get(id) >= 0);
+		return id != VoxelReader.UNKNOWN && (looks.kind[id] == BlockLooks.WATER || looks.wetShape[id] >= 0);
 	}
 
 	/** {@code faces}' parts the rays that aren't in the rock meet, as lo, hi pairs. */
@@ -791,18 +795,14 @@ public final class GpuMesher {
 	 */
 	private static void voxels(Mesh mesh, TileBaker helper, VoxelReader reader, int fx0, int fx1, int fy0, int fy1, int fz0, int fz1) {
 		int reach = TileBaker.SKY_REACH + 1;
-		// Under a roof the GPU walks shadow rays through the table too (see bake.fsh), as far as
-		// the tracer's go toward the sun: west, a little south, and up.
-		int west = reach;
-		int south = reach;
-		int up = reach;
-		if (mesh.lifted) {
-			double elevation = Math.toRadians(MapStyle.get().sunElevation());
-			double flat = TileBaker.SHADOW_DISTANCE * Math.cos(elevation);
-			west = Math.max(reach, (int) Math.ceil(flat * -TileBaker.SUN_AZIMUTH_X) + 2);
-			south = Math.max(reach, (int) Math.ceil(flat * TileBaker.SUN_AZIMUTH_Z) + 2);
-			up = Math.max(reach, (int) Math.ceil(TileBaker.SHADOW_DISTANCE * Math.sin(elevation)) + 2);
-		}
+		// Where the shadow map's caster is past the shadow's reach, the GPU walks shadow rays
+		// through the table too (see bake.fsh), as far as the tracer's go toward the sun: west, a
+		// little south, and up.
+		double elevation = Math.toRadians(MapStyle.get().sunElevation());
+		double flat = TileBaker.SHADOW_DISTANCE * Math.cos(elevation);
+		int west = Math.max(reach, (int) Math.ceil(flat * -TileBaker.SUN_AZIMUTH_X) + 2);
+		int south = Math.max(reach, (int) Math.ceil(flat * TileBaker.SUN_AZIMUTH_Z) + 2);
+		int up = Math.max(reach, (int) Math.ceil(TileBaker.SHADOW_DISTANCE * Math.sin(elevation)) + 2);
 		int sx0 = (fx0 - west) >> 4;
 		int sx1 = (fx1 + reach) >> 4;
 		int sz0 = (fz0 - reach) >> 4;
@@ -831,13 +831,22 @@ public final class GpuMesher {
 						out[index] = SECTION_EMPTY;
 						continue;
 					}
-					if (next + 128 > out.length) {
+					// On the surface the GPU's shadow walk passes smaller blocks (see bake.fsh), so mark them.
+					long[] partial = mesh.lifted ? null : reader.partialSection(sx, sy, sz);
+					boolean marked = partial != null && !VoxelReader.nothingSolid(partial);
+					if (next + 256 > out.length) {
 						out = java.util.Arrays.copyOf(out, out.length * 2);
 					}
-					out[index] = next;
+					out[index] = marked ? next | SECTION_PARTIAL : next;
 					for (int w = 0; w < 64; w++) {
 						out[next++] = (int) mask[w];
 						out[next++] = (int) (mask[w] >>> 32);
+					}
+					if (marked) {
+						for (int w = 0; w < 64; w++) {
+							out[next++] = (int) partial[w];
+							out[next++] = (int) (partial[w] >>> 32);
+						}
 					}
 				}
 			}
@@ -963,9 +972,17 @@ public final class GpuMesher {
 			double z0 = (lo >> 16 & 255) / (double) ShapeFaces.UNIT;
 			double y1 = (hi >> 8 & 255) / (double) ShapeFaces.UNIT;
 			double z1 = (hi >> 16 & 255) / (double) ShapeFaces.UNIT;
-			boolean top = quads.data[i + 3] == TOP;
-			double y = quads.data[i + 1] + (top ? y1 : (y0 + y1) / 2);
-			double z = quads.data[i + 2] + (top ? (z0 + z1) / 2 : z1);
+			double y = quads.data[i + 1];
+			double z = quads.data[i + 2];
+			// A branch, not a boolean: Java 21.0.8 and older can crash compiling `face == TOP` kept as
+			// a value (JDK-8358534), and Minecraft's launcher gives 1.20.5 to 1.21.11 Java 21.0.7.
+			if (quads.data[i + 3] == TOP) {
+				y += y1;
+				z += (z0 + z1) / 2;
+			} else {
+				y += (y0 + y1) / 2;
+				z += z1;
+			}
 			double depth = -(sin * y + cos * z);
 			long d = (long) (depth * 1024);
 			order[q] = (d << 24) | q;

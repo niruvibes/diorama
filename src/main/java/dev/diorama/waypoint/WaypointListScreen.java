@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
@@ -19,9 +20,6 @@ import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
-//? if >=1.21.11 {
-import net.minecraft.server.permissions.Permissions;
-//?}
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -83,6 +81,10 @@ public final class WaypointListScreen extends Screen {
 	 * keyboard focus, and must not act on a row it no longer sits on.
 	 */
 	private final List<Button> actions = new ArrayList<>();
+	/** Edit and Delete, which a waystone's row goes without, and Teleport, which is off for another dimension. */
+	private @Nullable Button edit;
+	private @Nullable Button teleport;
+	private @Nullable Button delete;
 	private final MapPiece piece = new MapPiece(88, 56, 12);
 	/** The sample pin on the empty list's piece of map. */
 	private final Waypoint sample = new Waypoint("Home", 0, 0, 0, "", Waypoint.PALETTE[2]);
@@ -99,6 +101,13 @@ public final class WaypointListScreen extends Screen {
 	private long lastClick;
 	private @Nullable Waypoint lastClicked;
 	private boolean canTeleport;
+	/**
+	 * {@link Waystones#changes} when the rows were made. When it moves on, the screen is made again
+	 * if it shows the Waystones folder or that folder comes or goes, and otherwise left alone, as
+	 * making it again resets the search box's cursor.
+	 */
+	private int waystoneChanges;
+	private boolean hadWaystones;
 	/** Set by the add-waypoint key; tick() opens the editor. */
 	private boolean newWaypointPressed;
 	private boolean xaeroRead;
@@ -119,7 +128,7 @@ public final class WaypointListScreen extends Screen {
 	}
 
 	/** Shows the folder with this key when the screen opens again. */
-	void showFolder(String key) {
+	public void showFolder(String key) {
 		this.folderKey = key;
 		this.selected = null;
 		this.scroll = 0;
@@ -127,7 +136,8 @@ public final class WaypointListScreen extends Screen {
 
 	/**
 	 * The folders: the Overworld, the Nether and the End always, any other dimension with waypoints
-	 * or the player in it, then the player's own in the order they were made.
+	 * or the player in it, then the player's own in the order they were made, then Waystones when
+	 * the Waystones mod has told the player of any.
 	 */
 	private void collectFolders(@Nullable WaypointStore store, @Nullable String here) {
 		this.folders.clear();
@@ -148,6 +158,9 @@ public final class WaypointListScreen extends Screen {
 		if (store != null) {
 			for (String name : store.customFolders()) {
 				this.folders.add(new Folder(WaypointStore.customKey(name), Component.literal(name), null, name));
+			}
+			if (!store.waystones().isEmpty()) {
+				this.folders.add(new Folder(WaypointStore.WAYSTONES_KEY, Component.translatable("diorama.folder.waystones"), null, null));
 			}
 		}
 		if (this.folderKey == null || this.folders.stream().noneMatch(f -> f.key().equals(this.folderKey))) {
@@ -185,7 +198,7 @@ public final class WaypointListScreen extends Screen {
 		this.collectFolders(store, here);
 		if (store != null && player != null && here != null) {
 			String key = this.folder().key();
-			for (Waypoint waypoint : store.all()) {
+			for (Waypoint waypoint : key.equals(WaypointStore.WAYSTONES_KEY) ? store.waystones() : store.all()) {
 				if (store.folderKey(waypoint).equals(key)) {
 					this.all.add(waypoint);
 				}
@@ -195,22 +208,21 @@ public final class WaypointListScreen extends Screen {
 				.thenComparingDouble(w -> w.dimension.equals(here) ? w.distanceTo(player.getX(), player.getY(), player.getZ()) : 0)
 				.thenComparing(w -> w.name.toLowerCase(Locale.ROOT)));
 		}
-		this.empty = store == null || store.all().isEmpty() && store.customFolders().isEmpty();
+		this.empty = store == null || store.all().isEmpty() && store.customFolders().isEmpty() && store.waystones().isEmpty();
+		this.waystoneChanges = Waystones.changes();
+		this.hadWaystones = store != null && !store.waystones().isEmpty();
 		this.folderArmed = false;
 		this.folderActions.clear();
 		if (this.selected != null && !this.all.contains(this.selected)) {
-			this.selected = null;
+			// A waystone is a new object each time the server sends it: find it again by its id.
+			UUID id = this.selected.id;
+			this.selected = this.all.stream().filter(w -> w.id.equals(id)).findFirst().orElse(null);
 		}
 		if (!this.xaeroRead) {
 			this.xaeroRead = true;
 			this.xaero = XaeroImport.find();
 		}
-		//? if >=1.21.11 {
-		this.canTeleport = player != null && player.permissions().hasPermission(Permissions.COMMANDS_GAMEMASTER);
-		//?} else {
-		/*// Permission level 2 is the game master level /tp needs.
-		this.canTeleport = player != null && player.hasPermissions(2);
-		*///?}
+		this.canTeleport = Waypoints.canTeleport();
 		int cx = this.width / 2;
 		int left = cx - LIST_WIDTH / 2;
 
@@ -222,7 +234,13 @@ public final class WaypointListScreen extends Screen {
 		if (importButton != null) {
 			above -= 24;
 			this.addRenderableWidget(importButton);
+			//? if >=1.21 {
 			importButton.setRectangle(204, 20, cx - 102, above);
+			//?} else {
+			/*// No setRectangle on 1.20.1; the button is already 20 tall.
+			importButton.setWidth(204);
+			importButton.setPosition(cx - 102, above);
+			*///?}
 		}
 		if (this.imported != null) {
 			above -= 12;
@@ -289,16 +307,20 @@ public final class WaypointListScreen extends Screen {
 		this.addRenderableWidget(Button.builder(Component.translatable("diorama.waypoint.new"), b -> this.newWaypoint())
 			.bounds(left + LIST_WIDTH - NEW_WIDTH, SEARCH_Y, NEW_WIDTH, 20).build());
 		this.actions.clear();
-		this.actions.add(this.action(Component.translatable("diorama.waypoints.edit"), () -> this.edit(this.selected)));
+		this.edit = this.action(Component.translatable("diorama.waypoints.edit"), () -> this.edit(this.selected));
+		this.actions.add(this.edit);
 		this.visibility = this.action(Component.translatable("diorama.waypoints.hide"), () -> this.toggleVisible(this.selected));
 		this.actions.add(this.visibility);
+		this.teleport = null;
 		if (this.canTeleport) {
-			this.actions.add(this.action(Component.translatable("diorama.waypoint.teleport"), () -> this.teleport(this.selected)));
+			this.teleport = this.action(Component.translatable("diorama.waypoint.teleport"), () -> this.teleport(this.selected));
+			this.actions.add(this.teleport);
 		}
-		this.actions.add(this.action(Component.translatable("diorama.waypoint.delete").withStyle(ChatFormatting.RED), () -> {
+		this.delete = this.action(Component.translatable("diorama.waypoint.delete").withStyle(ChatFormatting.RED), () -> {
 			this.armed = true;
 			this.placeRowButtons();
-		}));
+		});
+		this.actions.add(this.delete);
 		this.confirm = this.addRenderableWidget(Button.builder(Component.translatable("diorama.menu.delete_confirm").withStyle(ChatFormatting.RED), b -> {
 			if (this.armed) {
 				this.delete(this.selected);
@@ -342,6 +364,7 @@ public final class WaypointListScreen extends Screen {
 	/**
 	 * The selected row's buttons, right-aligned inside it: Edit, Hide or Show, Teleport, then
 	 * Delete in red. Once Delete is clicked they become one red Click again to delete across them.
+	 * A waystone's row has only Hide or Show and Teleport.
 	 */
 	private void placeRowButtons() {
 		int index = this.selected == null ? -1 : this.rows.indexOf(this.selected) - this.scroll;
@@ -352,26 +375,36 @@ public final class WaypointListScreen extends Screen {
 			visibility.setMessage(label);
 			visibility.setWidth(width(this.font.width(label)));
 		}
+		List<Button> buttons = this.rowActions();
 		int span = -ACTION_GAP;
-		for (Button button : this.actions) {
+		for (Button button : buttons) {
 			span += button.getWidth() + ACTION_GAP;
 		}
 		int right = this.width / 2 + LIST_WIDTH / 2 - 2;
 		int y = shown ? this.rowY(index) + 2 : 0;
 		int x = right - span;
 		for (Button button : this.actions) {
-			show(button, shown && !this.armed);
+			boolean has = buttons.contains(button);
+			show(button, shown && !this.armed && has);
 			button.setPosition(x, y);
-			x += button.getWidth() + ACTION_GAP;
+			if (has) {
+				x += button.getWidth() + ACTION_GAP;
+			}
 		}
 		// Teleporting runs /tp here, so it only makes sense for a waypoint in this dimension.
-		if (shown && this.canTeleport && this.minecraft.level != null && this.actions.size() > 3) {
-			this.actions.get(2).active = !this.armed && this.selected.dimension.equals(this.minecraft.level.dimension().identifier().toString());
+		Button teleport = this.teleport;
+		if (shown && teleport != null && this.minecraft.level != null) {
+			teleport.active = !this.armed && this.selected.dimension.equals(this.minecraft.level.dimension().identifier().toString());
 		}
 		Button confirm = this.confirm;
 		if (confirm != null) {
 			show(confirm, shown && this.armed);
+			//? if >=1.21 {
 			confirm.setRectangle(span, 20, right - span, y);
+			//?} else {
+			/*confirm.setWidth(span);
+			confirm.setPosition(right - span, y);
+			*///?}
 		}
 	}
 
@@ -396,7 +429,12 @@ public final class WaypointListScreen extends Screen {
 		if (custom) {
 			Button confirm = this.folderActions.get(this.folderActions.size() - 1);
 			show(confirm, this.folderArmed);
+			//? if >=1.21 {
 			confirm.setRectangle(span, 20, right - span, FOLDER_Y);
+			//?} else {
+			/*confirm.setWidth(span);
+			confirm.setPosition(right - span, FOLDER_Y);
+			*///?}
 		}
 	}
 
@@ -414,13 +452,30 @@ public final class WaypointListScreen extends Screen {
 		return Math.max(32, label + 10);
 	}
 
+	/** The buttons the selected row has: all of them, or for a waystone all but Edit and Delete. */
+	private List<Button> rowActions() {
+		if (this.selected == null || this.selected.editable()) {
+			return this.actions;
+		}
+		List<Button> buttons = new ArrayList<>(this.actions);
+		buttons.remove(this.edit);
+		buttons.remove(this.delete);
+		return buttons;
+	}
+
 	/** How wide the selected row's buttons are together, with the gap before them. */
 	private int actionsWidth() {
 		int span = 0;
-		for (Button button : this.actions) {
+		for (Button button : this.rowActions()) {
 			span += button.getWidth() + ACTION_GAP;
 		}
 		return span;
+	}
+
+	/** Where a row's badge is centred, from the row's left: a round one in its usual place, a wider one with its left edge there. */
+	private static float badgeX(Waypoint waypoint) {
+		int width = Pins.badgeWidth(waypoint, Pins.LARGE);
+		return width > Pins.LARGE ? 4 + width / 2.0F : 11.5F;
 	}
 
 	private int rowY(int index) {
@@ -440,9 +495,21 @@ public final class WaypointListScreen extends Screen {
 		return this.scroll + index;
 	}
 
+	//? if >=1.21 {
 	@Override
 	public void extractBackground(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float a) {
 		super.extractBackground(graphics, mouseX, mouseY, a);
+	//?} else {
+	/*// A 1.20.1 screen draws its own background, and its render method draws only the widgets.
+	@Override
+	public void render(GuiGraphics graphics, int mouseX, int mouseY, float a) {
+		this.drawBackground(graphics, mouseX, mouseY);
+		super.render(graphics, mouseX, mouseY, a);
+	}
+
+	private void drawBackground(GuiGraphics graphics, int mouseX, int mouseY) {
+		this.renderBackground(graphics);
+	*///?}
 		// Drawn with the background, so the buttons go on top of it: before 1.21.6 a screen's own
 		// drawing comes after its background, and the rows have to be under their buttons.
 		//? if >=1.21.6 {
@@ -483,6 +550,11 @@ public final class WaypointListScreen extends Screen {
 			graphics.centeredText(this.font, Component.translatable(this.all.isEmpty() ? "diorama.folder.empty" : "diorama.waypoints.no_match"), cx, LIST_TOP + 20, HINT);
 		}
 		String here = this.minecraft.level == null ? "" : this.minecraft.level.dimension().identifier().toString();
+		// Names start clear of the widest badge showing: initials of three or four letters widen it.
+		int textLeft = TEXT_LEFT;
+		for (int i = 0; i < this.visibleRows && this.scroll + i < this.rows.size(); i++) {
+			textLeft = Math.max(textLeft, (int) Math.ceil(badgeX(this.rows.get(this.scroll + i)) + Pins.badgeWidth(this.rows.get(this.scroll + i), Pins.LARGE) / 2.0F) + 2);
+		}
 		for (int i = 0; i < this.visibleRows && this.scroll + i < this.rows.size(); i++) {
 			Waypoint waypoint = this.rows.get(this.scroll + i);
 			int y = this.rowY(i);
@@ -490,11 +562,11 @@ public final class WaypointListScreen extends Screen {
 			if (selected) {
 				ScreenArt.selection(graphics, left, y, right, y + ROW);
 			}
-			Pins.badge(graphics, waypoint, left + 11.5F, y + 12.5F, Pins.LARGE);
+			Pins.badge(graphics, waypoint, left + badgeX(waypoint), y + 12.5F, Pins.LARGE);
 			// The name and position stop short of the selected row's buttons.
-			int room = right - (selected ? this.actionsWidth() + 4 : 6) - (left + TEXT_LEFT);
+			int room = right - (selected ? this.actionsWidth() + 4 : 6) - (left + textLeft);
 			String name = this.fit(waypoint.name, room);
-			graphics.text(this.font, name, left + TEXT_LEFT, y + 4, waypoint.visible && !folderHidden ? 0xFFFFFFFF : HIDDEN, true);
+			graphics.text(this.font, name, left + textLeft, y + 4, waypoint.visible && !folderHidden ? 0xFFFFFFFF : HIDDEN, true);
 			String detail = waypoint.x + ", " + waypoint.y + ", " + waypoint.z;
 			if (!waypoint.dimension.equals(here)) {
 				detail = Waypoints.dimensionName(waypoint.dimension).getString() + " · " + detail;
@@ -505,8 +577,8 @@ public final class WaypointListScreen extends Screen {
 				detail += "  ·  " + Component.translatable("diorama.waypoint.hidden").getString();
 			}
 			String shownDetail = this.fit(detail, room);
-			graphics.text(this.font, shownDetail, left + TEXT_LEFT, y + 14, DETAIL, true);
-			boolean overText = mouseX >= left + TEXT_LEFT && mouseX < left + TEXT_LEFT + room && mouseY >= y && mouseY < y + ROW;
+			graphics.text(this.font, shownDetail, left + textLeft, y + 14, DETAIL, true);
+			boolean overText = mouseX >= left + textLeft && mouseX < left + textLeft + room && mouseY >= y && mouseY < y + ROW;
 			if (overText && (!name.equals(waypoint.name) || !shownDetail.equals(detail))) {
 				//? if >=1.21.6 {
 				graphics.setComponentTooltipForNextFrame(this.font, List.of(Component.literal(waypoint.name), Component.literal(detail)), mouseX, mouseY);
@@ -617,10 +689,25 @@ public final class WaypointListScreen extends Screen {
 		return this.font.plainSubstrByWidth(text, Math.max(0, width - this.font.width(ellipsis))) + ellipsis;
 	}
 
+	// The mouse wheel had only the one axis on 1.20.1.
 	@Override
+	//? if >=1.21 {
 	public boolean mouseScrolled(double x, double y, double scrollX, double scrollY) {
+	//?} else {
+	/*public boolean mouseScrolled(double x, double y, double scrollY) {
+	*///?}
 		this.scrollTo(this.scroll - (int) Math.signum(scrollY));
 		return true;
+	}
+
+	/**
+	 * The buttons the list itself clicks with. A click over a widget counts as the widget's whatever
+	 * the button, though widgets only act on the left one, so a middle or side button bound to add a
+	 * waypoint is checked before them, as a key is. A binding on these two waits until nothing else
+	 * takes the click.
+	 */
+	private static boolean usedByList(int button) {
+		return button == InputConstants.MOUSE_BUTTON_LEFT || button == InputConstants.MOUSE_BUTTON_RIGHT;
 	}
 
 	// Mouse and key events came as separate numbers before 1.21.9. Each override hands them to a
@@ -638,6 +725,10 @@ public final class WaypointListScreen extends Screen {
 	@Override
 	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
 		this.disarmUnless(event.x(), event.y());
+		if (!usedByList(event.button()) && DioramaClient.NEW_WAYPOINT.matchesMouse(event)) {
+			this.newWaypointPressed = true;
+			return true;
+		}
 		if (super.mouseClicked(event, doubleClick)) {
 			return true;
 		}
@@ -671,6 +762,10 @@ public final class WaypointListScreen extends Screen {
 	@Override
 	public boolean mouseClicked(double x, double y, int button) {
 		this.disarmUnless(x, y);
+		if (!usedByList(button) && DioramaClient.NEW_WAYPOINT.matchesMouse(button)) {
+			this.newWaypointPressed = true;
+			return true;
+		}
 		if (super.mouseClicked(x, y, button)) {
 			return true;
 		}
@@ -760,6 +855,16 @@ public final class WaypointListScreen extends Screen {
 
 	@Override
 	public void tick() {
+		// A waystone renamed, moved or gone while the list is open, or the Waystones folder coming or going.
+		int changes = Waystones.changes();
+		if (changes != this.waystoneChanges) {
+			this.waystoneChanges = changes;
+			WaypointStore store = WaypointStore.get();
+			boolean hasWaystones = store != null && !store.waystones().isEmpty();
+			if (hasWaystones != this.hadWaystones || WaypointStore.WAYSTONES_KEY.equals(this.folderKey)) {
+				this.rebuildWidgets();
+			}
+		}
 		if (this.newWaypointPressed) {
 			this.newWaypointPressed = false;
 			this.newWaypoint();
@@ -779,7 +884,7 @@ public final class WaypointListScreen extends Screen {
 	}
 
 	private void edit(@Nullable Waypoint waypoint) {
-		if (waypoint != null) {
+		if (waypoint != null && waypoint.editable()) {
 			this.minecraft.gui.setScreen(new WaypointEditScreen(this, waypoint, false));
 		}
 	}
@@ -788,10 +893,9 @@ public final class WaypointListScreen extends Screen {
 		if (waypoint == null) {
 			return;
 		}
-		waypoint.visible = !waypoint.visible;
 		WaypointStore store = WaypointStore.get();
 		if (store != null) {
-			store.changed();
+			store.setVisible(waypoint, !waypoint.visible);
 		}
 		this.placeRowButtons();
 	}
@@ -807,9 +911,8 @@ public final class WaypointListScreen extends Screen {
 	}
 
 	private void teleport(@Nullable Waypoint waypoint) {
-		LocalPlayer player = this.minecraft.player;
-		if (player != null && waypoint != null) {
-			player.connection.sendCommand("tp @s " + waypoint.x + " " + waypoint.y + " " + waypoint.z);
+		if (waypoint != null) {
+			Waypoints.teleport(waypoint.x, waypoint.y, waypoint.z);
 		}
 		this.minecraft.gui.setScreen(null);
 	}
@@ -817,6 +920,11 @@ public final class WaypointListScreen extends Screen {
 	/** The waypoint whose row is selected, or null. For tests. */
 	public @Nullable Waypoint selected() {
 		return this.selected;
+	}
+
+	/** The name of the folder shown. For tests. */
+	public String folderName() {
+		return this.folders.isEmpty() ? "" : this.folder().name().getString();
 	}
 
 	/** The rows the search lets through, nearest first. For tests. */

@@ -4,12 +4,15 @@ import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.level.NaturalSpawner;
 import com.mojang.blaze3d.platform.NativeImage;
 import dev.diorama.Diorama;
+import dev.diorama.data.Copycats;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntSupplier;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColors;
@@ -25,7 +28,6 @@ import net.minecraft.client.renderer.block.model.BlockStateModel;
 *///?} else {
 /*import net.minecraft.client.renderer.block.BlockModelShaper;
 import net.minecraft.client.resources.model.BakedModel;
-import org.jspecify.annotations.Nullable;
 *///?}
 //? if <26.1 && fabric {
 /*import net.fabricmc.fabric.api.client.render.fluid.v1.FluidRenderHandler;
@@ -35,11 +37,11 @@ import net.fabricmc.loader.api.FabricLoader;
 /*import net.minecraft.data.AtlasIds;
 import net.neoforged.neoforge.client.extensions.common.IClientFluidTypeExtensions;
 *///?} else if <26.1 {
-/*import net.minecraft.client.renderer.texture.TextureAtlas;
-import net.neoforged.neoforge.client.extensions.common.IClientFluidTypeExtensions;
+/*import net.neoforged.neoforge.client.extensions.common.IClientFluidTypeExtensions;
 *///?}
 import net.minecraft.client.renderer.texture.MissingTextureAtlasSprite;
 import net.minecraft.client.renderer.texture.SpriteContents;
+import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 //? if >=26.1 {
 import net.minecraft.client.resources.model.geometry.BakedQuad;
@@ -61,11 +63,16 @@ import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import net.minecraft.world.level.material.Fluid;
+import org.jspecify.annotations.Nullable;
 
 /**
  * What each block state looks like on the map: how rays treat it, and its average top and
- * front colors taken from the game's own textures. Built once on the client thread, then
- * read-only, so bake threads can use it freely.
+ * front colors taken from the game's own textures. Built once on the client thread; after that
+ * the registry's looks never change, so bake threads can read them freely.
+ *
+ * <p>When a mod with copycats is installed, ids past the block state registry are looks for
+ * filled copycats ({@link #copycat}), added by bake threads as they first meet them. Each is
+ * written before its id is handed out, and never changes after.
  */
 public final class BlockLooks {
 	public static final byte AIR = 0;
@@ -84,6 +91,7 @@ public final class BlockLooks {
 	public static final byte TINT_WATER = 4;
 
 	private static volatile BlockLooks current;
+	private static int builds;
 	/** The models the current table was built from; a resource reload replaces them. */
 	private static Object builtFrom;
 
@@ -119,11 +127,24 @@ public final class BlockLooks {
 	public float[][] shapes;
 	/**
 	 * For a waterlogged block smaller than a cube, the state id of the fluid around it: rays that
-	 * pass beside the block, or reach it from above, go through that fluid.
+	 * pass beside the block, or reach it from above, go through that fluid. -1 for every other block.
 	 */
-	public final it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap wetShapes = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
+	public final int[] wetShape;
 
-	private BlockLooks(int size) {
+	/**
+	 * How many filled-copycat looks fit past the registry. Each pairing of a copycat state with a
+	 * material takes one; past this many, more copycats draw as they do empty.
+	 */
+	private static final int COPYCAT_LOOKS = 1 << 14;
+	/** The block state registry's size: ids from here on are filled copycats. */
+	private final int registrySize;
+	/** Filled-copycat look ids, by copycat state id in the high half and material state id in the low half. */
+	private final Map<Long, Integer> copycatIds = new ConcurrentHashMap<>();
+	private final AtomicInteger copycatCount = new AtomicInteger();
+	private volatile boolean warnedCopycats;
+
+	private BlockLooks(int registrySize, int size) {
+		this.registrySize = registrySize;
 		this.kind = new byte[size];
 		this.tint = new byte[size];
 		this.emission = new byte[size];
@@ -137,6 +158,8 @@ public final class BlockLooks {
 		this.spawnOn = new boolean[size];
 		this.spawnIn = new boolean[size];
 		this.shape = new int[size];
+		this.wetShape = new int[size];
+		java.util.Arrays.fill(this.wetShape, -1);
 	}
 
 	public static BlockLooks get() {
@@ -164,7 +187,73 @@ public final class BlockLooks {
 			// Same index, same boxes: outlines are stored once each.
 			&& this.shape[a] == this.shape[b]
 			// Filling or draining a waterlogged slab changes nothing else.
-			&& this.wetShapes.get(a) == this.wetShapes.get(b);
+			&& this.wetShape[a] == this.wetShape[b];
+	}
+
+	/**
+	 * The look of a copycat filled with a material, both given as state ids: the copycat's outline,
+	 * spawn rules and water, with the material's colours, tint and light. Rays pass through it if
+	 * they pass through the material, as through a copycat filled with glass, and pass through a
+	 * copycat without collision (a button, a pressure plate) as they do empty. Any thread: a bake
+	 * calls this when it reads a snapshot's copycats, and the look is filled in before its id is
+	 * handed out, so a bake only ever reads looks that are done. Returns the copycat's own id when
+	 * there's nothing to copy, or no room left.
+	 */
+	public int copycat(int copycat, int material) {
+		if (copycat < 0 || copycat >= this.registrySize || material < 0 || material >= this.registrySize || this.kind.length == this.registrySize) {
+			return copycat;
+		}
+		byte frame = this.kind[copycat];
+		if (frame != SOLID && frame != GLASS && frame != PLANT || this.kind[material] == AIR) {
+			return copycat;
+		}
+		Long key = (long) copycat << 32 | material;
+		Integer id = this.copycatIds.get(key);
+		if (id != null) {
+			return id;
+		}
+		if (this.copycatCount.get() >= this.kind.length - this.registrySize) {
+			// Full: don't grow the table with pairs that would all draw empty anyway.
+			this.warnFull();
+			return copycat;
+		}
+		return this.copycatIds.computeIfAbsent(key, unused -> this.addCopycat(copycat, material));
+	}
+
+	private void warnFull() {
+		if (!this.warnedCopycats) {
+			this.warnedCopycats = true;
+			Diorama.LOGGER.warn("More than {} kinds of filled copycat; the rest draw as they do empty", COPYCAT_LOOKS);
+		}
+	}
+
+	private int addCopycat(int copycat, int material) {
+		int id = this.registrySize + this.copycatCount.getAndIncrement();
+		if (id >= this.kind.length) {
+			// Bake threads that passed the check above together.
+			this.warnFull();
+			return copycat;
+		}
+		this.kind[id] = this.kind[copycat] == PLANT ? PLANT : this.kind[material] == GLASS ? GLASS : SOLID;
+		this.shape[id] = this.shape[copycat];
+		this.spawnOn[id] = this.spawnOn[copycat];
+		this.spawnIn[id] = this.spawnIn[copycat];
+		this.wetShape[id] = this.wetShape[copycat];
+		this.top[id] = this.top[material];
+		this.topTinted[id] = this.topTinted[material];
+		this.topTintWeight[id] = this.topTintWeight[material];
+		this.side[id] = this.side[material];
+		this.sideTinted[id] = this.sideTinted[material];
+		this.sideTintWeight[id] = this.sideTintWeight[material];
+		this.tint[id] = this.tint[material];
+		this.constantTint[id] = this.constantTint[material];
+		this.emission[id] = this.emission[material];
+		return id;
+	}
+
+	/** For tests: how many times the table has been built. */
+	public static int builds() {
+		return builds;
 	}
 
 	public static void invalidate() {
@@ -191,8 +280,9 @@ public final class BlockLooks {
 		*///?}
 		BlockColors colors = mc.getBlockColors();
 		int size = Block.BLOCK_STATE_REGISTRY.size();
-		BlockLooks looks = new BlockLooks(size);
+		BlockLooks looks = new BlockLooks(size, Copycats.INSTALLED ? size + COPYCAT_LOOKS : size);
 		Map<TextureAtlasSprite, float[]> spriteCache = new IdentityHashMap<>();
+		warnedFreed = false;
 		RandomSource random = RandomSource.create(42L);
 		TintProbe probe = new TintProbe();
 		Map<VoxelShape, Integer> shapeByVoxels = new IdentityHashMap<>();
@@ -267,12 +357,31 @@ public final class BlockLooks {
 			if (topFace.isEmpty() && sideFace.isEmpty()) {
 				// Block entities (chests, signs, beds) have no block model; use the particle texture.
 				//? if >=26.1 {
-				float[] avg = spriteAverage(model.particleMaterial().sprite(), spriteCache);
+				TextureAtlasSprite particle = model.particleMaterial().sprite();
 				//?} else {
-				/*float[] avg = spriteAverage(model.particleIcon(), spriteCache);
+				/*TextureAtlasSprite particle = model.particleIcon();
 				*///?}
-				topFace.add(avg, -1);
-				sideFace.add(avg, -1);
+				if (!isMissing(particle)) {
+					float[] avg = spriteAverage(particle, spriteCache);
+					topFace.add(avg, -1);
+					sideFace.add(avg, -1);
+				}
+			}
+			if (topFace.isEmpty() && sideFace.isEmpty()) {
+				// No texture to go by: a model that draws only from its block entity's data, which this
+				// table can't see (Copycats+ copycats take the look of the block they're filled with), a
+				// texture the game can't find, or one a reload freed with nothing in its place. Use the
+				// block's colour on Minecraft's own maps instead of the missing texture's purple, and see
+				// through it where those maps do.
+				int mapColor = mapColor(state);
+				if (mapColor == 0) {
+					looks.kind[id] = AIR;
+					looks.shape[id] = 0;
+					continue;
+				}
+				float[] flat = {(mapColor >> 16 & 0xFF) / 255.0F, (mapColor >> 8 & 0xFF) / 255.0F, (mapColor & 0xFF) / 255.0F, 1.0F};
+				topFace.add(flat, -1);
+				sideFace.add(flat, -1);
 			}
 			if (topFace.isEmpty()) {
 				topFace = sideFace;
@@ -324,17 +433,17 @@ public final class BlockLooks {
 			looks.constantTint[id] = look.tint().constant();
 		}
 		looks.shapes = shapes.toArray(new float[0][]);
-		looks.wetShapes.defaultReturnValue(-1);
 		for (BlockState state : Block.BLOCK_STATE_REGISTRY) {
 			int id = Block.BLOCK_STATE_REGISTRY.getId(state);
 			if (id >= 0 && id < size && looks.shape[id] != 0 && !state.getFluidState().isEmpty()) {
 				int fluid = Block.BLOCK_STATE_REGISTRY.getId(state.getFluidState().createLegacyBlock());
 				if (fluid >= 0 && fluid < size && looks.kind[fluid] == WATER) {
-					looks.wetShapes.put(id, fluid);
+					looks.wetShape[id] = fluid;
 				}
 			}
 		}
 		current = looks;
+		builds++;
 		//? if >=26.1 {
 		builtFrom = models;
 		//?} else {
@@ -445,7 +554,7 @@ public final class BlockLooks {
 		} catch (RuntimeException e) {
 			sprite = null;
 		}
-		if (sprite != null && sprite.contents().name().equals(MissingTextureAtlasSprite.getLocation())) {
+		if (sprite != null && isMissing(sprite)) {
 			// An unregistered fluid or a missing texture: better the block's particle colour than purple.
 			sprite = null;
 		}
@@ -520,28 +629,51 @@ public final class BlockLooks {
 	private static void accumulate(FaceColor face, List<BakedQuad> quads, Map<TextureAtlasSprite, float[]> cache) {
 		for (BakedQuad quad : quads) {
 			//? if >=26.1 {
-			face.add(spriteAverage(quad.materialInfo().sprite(), cache), quad.materialInfo().tintIndex());
+			TextureAtlasSprite sprite = quad.materialInfo().sprite();
+			int tintIndex = quad.materialInfo().tintIndex();
 			//?} else {
-			/*face.add(spriteAverage(quad.sprite(), cache), quad.tintIndex());
+			/*TextureAtlasSprite sprite = quad.sprite();
+			int tintIndex = quad.tintIndex();
 			*///?}
+			if (!isMissing(sprite)) {
+				face.add(spriteAverage(sprite, cache), tintIndex);
+			}
 		}
 	}
 
 	private static void accumulateLoose(FaceColor top, FaceColor side, List<BakedQuad> quads, Map<TextureAtlasSprite, float[]> cache) {
 		for (BakedQuad quad : quads) {
 			//? if >=26.1 {
-			float[] avg = spriteAverage(quad.materialInfo().sprite(), cache);
+			TextureAtlasSprite sprite = quad.materialInfo().sprite();
 			int tintIndex = quad.materialInfo().tintIndex();
 			//?} else {
-			/*float[] avg = spriteAverage(quad.sprite(), cache);
+			/*TextureAtlasSprite sprite = quad.sprite();
 			int tintIndex = quad.tintIndex();
 			*///?}
+			if (isMissing(sprite)) {
+				continue;
+			}
+			float[] avg = spriteAverage(sprite, cache);
 			if (quad.direction() == Direction.UP || quad.direction() == Direction.DOWN) {
 				top.add(avg, tintIndex);
 			} else {
 				top.add(avg, tintIndex);
 				side.add(avg, tintIndex);
 			}
+		}
+	}
+
+	/** The game's magenta and black stand-in for a texture it can't find. */
+	private static boolean isMissing(TextureAtlasSprite sprite) {
+		return sprite.contents().name().equals(MissingTextureAtlasSprite.getLocation());
+	}
+
+	/** The block's colour on Minecraft's own maps as 0xRRGGBB, or 0 where those maps see through it. */
+	private static int mapColor(BlockState state) {
+		try {
+			return state.getMapColor(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).col;
+		} catch (RuntimeException e) {
+			return 0;
 		}
 	}
 
@@ -569,22 +701,61 @@ public final class BlockLooks {
 	/** Returns {r, g, b, coverage} averaged over the sprite's visible pixels, colors in 0..1. */
 	private static float[] spriteAverage(TextureAtlasSprite sprite, Map<TextureAtlasSprite, float[]> cache) {
 		return cache.computeIfAbsent(sprite, s -> {
-			SpriteContents contents = s.contents();
-			NativeImage image = null;
-			try {
-				image = ORIGINAL_IMAGE == null ? null : (NativeImage) ORIGINAL_IMAGE.get(contents);
-			} catch (IllegalAccessException ignored) {
+			float[] avg = average(s);
+			if (avg != null) {
+				return avg;
 			}
-			if (image == null) {
-				return new float[] {1.0F, 0.0F, 1.0F, 1.0F};
+			// The sprite is from the atlas before the last resource reload, which freed its image: a
+			// model that outlived the reload still points at it (issue 94, a big NeoForge pack). Read
+			// the texture of that name in the atlas now; if the atlas has none, it adds no colour.
+			TextureAtlasSprite current = currentSprite(s);
+			avg = current == null ? null : average(current);
+			if (!warnedFreed) {
+				warnedFreed = true;
+				Diorama.LOGGER.warn("A block model holds texture {} from before the last resource reload; {}", s.contents().name(),
+					avg != null ? "using the reloaded texture" : "it adds no colour");
 			}
-			int w = Math.min(contents.width(), image.getWidth());
-			int h = Math.min(contents.height(), image.getHeight());
-			double r = 0;
-			double g = 0;
-			double b = 0;
-			double weight = 0;
-			int visible = 0;
+			return avg != null ? avg : new float[] {0.0F, 0.0F, 0.0F, 0.0F};
+		});
+	}
+
+	/** Set once per build, so a mod that keeps many old models is named once in the log. */
+	private static boolean warnedFreed;
+
+	/** The sprite with the same name in its atlas as the atlas is now, or null if there's none. */
+	private static @Nullable TextureAtlasSprite currentSprite(TextureAtlasSprite old) {
+		try {
+			// Atlases are registered once at startup and filled again by each reload, so this finds
+			// the existing atlas rather than adding a texture.
+			if (Minecraft.getInstance().getTextureManager().getTexture(old.atlasLocation()) instanceof TextureAtlas atlas) {
+				TextureAtlasSprite sprite = atlas.getSprite(old.contents().name());
+				return sprite == old || sprite.contents().name().equals(MissingTextureAtlasSprite.getLocation()) ? null : sprite;
+			}
+		} catch (RuntimeException e) {
+			// The atlas isn't filled, or a mod's atlas isn't a TextureAtlas.
+		}
+		return null;
+	}
+
+	/** {@link #spriteAverage} for one sprite, or null if its image has been freed. */
+	private static float @Nullable [] average(TextureAtlasSprite s) {
+		SpriteContents contents = s.contents();
+		NativeImage image = null;
+		try {
+			image = ORIGINAL_IMAGE == null ? null : (NativeImage) ORIGINAL_IMAGE.get(contents);
+		} catch (IllegalAccessException ignored) {
+		}
+		if (image == null) {
+			return new float[] {1.0F, 0.0F, 1.0F, 1.0F};
+		}
+		int w = Math.min(contents.width(), image.getWidth());
+		int h = Math.min(contents.height(), image.getHeight());
+		double r = 0;
+		double g = 0;
+		double b = 0;
+		double weight = 0;
+		int visible = 0;
+		try {
 			for (int y = 0; y < h; y++) {
 				for (int x = 0; x < w; x++) {
 					//? if >=1.21.2 {
@@ -607,14 +778,17 @@ public final class BlockLooks {
 					visible++;
 				}
 			}
-			if (weight == 0) {
-				return new float[] {0.0F, 0.0F, 0.0F, 0.0F};
-			}
-			return new float[] {
-				(float) linearToSrgb(r / weight), (float) linearToSrgb(g / weight), (float) linearToSrgb(b / weight),
-				(float) visible / (w * h)
-			};
-		});
+		} catch (IllegalStateException freed) {
+			// "Image is not allocated": NativeImage checks before every read.
+			return null;
+		}
+		if (weight == 0) {
+			return new float[] {0.0F, 0.0F, 0.0F, 0.0F};
+		}
+		return new float[] {
+			(float) linearToSrgb(r / weight), (float) linearToSrgb(g / weight), (float) linearToSrgb(b / weight),
+			(float) visible / (w * h)
+		};
 	}
 
 	private static double srgbToLinear(int c) {

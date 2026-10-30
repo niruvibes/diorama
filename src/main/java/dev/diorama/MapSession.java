@@ -4,6 +4,7 @@ import dev.diorama.bake.BlockLooks;
 import dev.diorama.bake.Overlays;
 import dev.diorama.bake.TileKey;
 import dev.diorama.data.ChunkSnapshot;
+import dev.diorama.data.Copycats;
 import dev.diorama.render.MapLevel;
 import java.nio.file.Path;
 import java.util.Iterator;
@@ -37,6 +38,7 @@ public final class MapSession {
 	private static final int SNAPSHOTS_PER_TICK = 24;
 
 	private static @Nullable MapSession current;
+	private static int started;
 	private static final boolean DEBUG_CHANGES = Diorama.DEBUG;
 	private static final Map<String, Integer> CHANGE_TALLY = new java.util.TreeMap<>();
 	private static long lastTallyLog;
@@ -54,16 +56,35 @@ public final class MapSession {
 		this.map = new MapLevel(level.getMinY(), level.getMaxY() + 1, roof, mapFolder(level, key));
 	}
 
-	/** {@code .minecraft/diorama/<world>/<dimension>}, or null outside a world. */
+	/** The folder of the dimension's map in use ({@link Maps}), or null outside a world. */
 	private static @Nullable Path mapFolder(ClientLevel level, @Nullable String key) {
 		if (key == null) {
 			return null;
 		}
-		return WorldKey.folder(key).resolve(WorldKey.key("dim", level.dimension().identifier().toString()));
+		Maps maps = Maps.of(key);
+		String dimension = level.dimension().identifier().toString();
+		return maps.tileFolder(dimension, maps.active(dimension));
+	}
+
+	/**
+	 * The player switched a dimension to another of its maps. If it's this one, the map is saved and
+	 * closed as on a dimension change, and the next tick starts one on the other map; its sweep for
+	 * loaded chunks maps what's around the player again.
+	 */
+	public static void mapChanged(String dimension) {
+		if (current != null && current.level.dimension().identifier().toString().equals(dimension)) {
+			current.map.close();
+			current = null;
+		}
 	}
 
 	public static @Nullable MapSession get() {
 		return current;
+	}
+
+	/** For tests: how many sessions have started, one each time the player's level changes. */
+	public static int started() {
+		return started;
 	}
 
 	/**
@@ -128,12 +149,18 @@ public final class MapSession {
 				return null;
 			}
 			current = new MapSession(level, key);
-			BlockLooks.invalidate();
+			started++;
 		}
 		return current;
 	}
 
 	public static void chunkLoaded(ClientLevel level, LevelChunk chunk) {
+		// Immersive Portals keeps the levels seen through its portals loaded too, and their chunks
+		// arrive while the client is briefly switched to them. The map follows the player's level.
+		LocalPlayer player = Minecraft.getInstance().player;
+		if (player == null || player.level() != level) {
+			return;
+		}
 		// Chunks can arrive before the first client tick of a new level, so this may start the session.
 		MapSession session = forLevel(level);
 		if (session == null) {
@@ -202,6 +229,23 @@ public final class MapSession {
 				}
 			}
 		}
+	}
+
+	/**
+	 * A block entity got new data from the server. Filling or emptying a copycat changes only its
+	 * block entity, not its block, so it comes this way: re-bake there if the copycat's material
+	 * isn't what the map last saw. A chunk the map hasn't seen yet gets it in its first snapshot.
+	 */
+	public static void blockEntityChanged(ClientLevel level, BlockPos pos) {
+		if (!Copycats.INSTALLED || current == null || current.level != level) {
+			return;
+		}
+		ChunkSnapshot snapshot = current.map.chunk(pos.getX() >> 4, pos.getZ() >> 4);
+		if (snapshot == null || Copycats.material(level.getBlockEntity(pos)) == snapshot.copycatMaterial(pos.getX(), pos.getY(), pos.getZ())) {
+			return;
+		}
+		int surface = current.visibleFromSky(pos) ? MapLevel.CHANGED_SURFACE : 0;
+		current.schedule(pos.getX() >> 4, pos.getZ() >> 4, CHANGE_DELAY_MS, new int[] {pos.getX(), pos.getY(), pos.getZ(), pos.getX(), pos.getY(), pos.getZ(), surface});
 	}
 
 	/**
@@ -350,7 +394,10 @@ public final class MapSession {
 			long key = entry.getKey();
 			int cx = (int) (key >> 32);
 			int cz = (int) key;
-			if (this.level.getChunkSource().getChunk(cx, cz, ChunkStatus.FULL, false) instanceof LevelChunk chunk) {
+			// Through Object: where getChunk already returns a LevelChunk, Java 17 (the 1.20.1 jar's)
+			// refuses an instanceof pattern that can't fail.
+			Object loaded = this.level.getChunkSource().getChunk(cx, cz, ChunkStatus.FULL, false);
+			if (loaded instanceof LevelChunk chunk) {
 				boolean known = this.map.chunk(cx, cz) != null;
 				this.map.put(ChunkSnapshot.take(chunk, this.level), known ? p.box : null, playerChunkX, playerChunkZ);
 				budget--;

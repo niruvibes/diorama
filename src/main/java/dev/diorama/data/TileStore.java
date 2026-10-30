@@ -5,6 +5,8 @@ import dev.diorama.Projection;
 import dev.diorama.bake.Mipmaps;
 import dev.diorama.bake.TileImage;
 import dev.diorama.bake.TileKey;
+import dev.diorama.bake.TileChunks;
+import dev.diorama.bake.TileSpots;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -51,18 +53,48 @@ import org.jspecify.annotations.Nullable;
  * children changed, so zooming out shows everything explored without baking anything. Only the
  * writer builds them: a missing overview tile means nothing under it was ever mapped.
  *
- * <p>File format: {@code OMT1}, the edge length, then the ABGR pixels deflated.
+ * <p>A level-0 tile also keeps its {@link TileSpots}, so the right-click menu still works there
+ * once the chunks are gone. An overview tile keeps its {@link TileChunks}, so land claims can be
+ * drawn on it; a level-0 tile's come from its spots.
+ *
+ * <p>File format: {@code OMT1}, the edge length, then deflated: the ABGR pixels, then on level-0
+ * tiles {@code SPT1} and the spots, and on overview tiles {@code CHK1} and the chunks. Versions
+ * from before spots read the pixels and stop there.
  */
 public final class TileStore {
+	/** Old fork sidecars are read only when native saved picks cannot answer. */
+	private final Map<TileKey, Optional<MapLocations>> legacyLocations = new LinkedHashMap<>(16, 0.75F, true) {
+		@Override
+		protected boolean removeEldestEntry(Map.Entry<TileKey, Optional<MapLocations>> eldest) {
+			return this.size() > 24;
+		}
+	};
+
+	/** Called off the render thread, like read/spots. Keeps existing fork maps interactive. */
+	public MapLocations.@Nullable Location legacyLocation(TileKey key, double u, double v) {
+		synchronized (this.legacyLocations) {
+			Optional<MapLocations> cached = this.legacyLocations.get(key);
+			if (cached == null) {
+				try {
+					cached = Optional.ofNullable(MapLocations.read(this.folder.resolve(key.tileU() + "_" + key.tileV() + ".omp")));
+				} catch (IOException e) {
+					Diorama.LOGGER.warn("Couldn't read older fork map locations for {}", key, e);
+					cached = Optional.empty();
+				}
+				this.legacyLocations.put(key, cached);
+			}
+			return cached.isEmpty() ? null : cached.get().at(u, v);
+		}
+	}
 	private static final int MAGIC = 0x4F4D5431;
+	private static final int SPOTS_MAGIC = 0x53505431;
+	private static final int CHUNKS_MAGIC = 0x43484B31;
 	private static final int CACHED_TILES = 24;
 	private static final long WRITE_DELAY_SECONDS = 3;
 	/** After a failed write (a full disk, say), try again this much later. */
 	private static final long RETRY_DELAY_SECONDS = 30;
 	/** Overview tiles are rebuilt this long after the first tile under them is written. */
 	private static final long OVERVIEW_DELAY_SECONDS = 2;
-	/** Old overview caches could omit children after a concurrent read. Rebuild them once. */
-	private static final String OVERVIEW_REVISION = "2";
 
 	/** The only thread that writes tiles. */
 	private static final ScheduledThreadPoolExecutor WRITER = new ScheduledThreadPoolExecutor(1, task -> {
@@ -88,10 +120,25 @@ public final class TileStore {
 	private final Map<TileKey, ArrayDeque<TileImage>> handedOver = new HashMap<>();
 	/** Tiles with a merge waiting on the writer thread, so a run of bakes queues one. Guarded by {@code this}. */
 	private final Set<TileKey> mergeQueued = new HashSet<>();
+	/**
+	 * A saved tile: its pixels, and its spots (level 0) or chunks (overviews) where it has any.
+	 * Never modified.
+	 */
+	private record Tile(int[] pixels, int @Nullable [] spots, byte @Nullable [] chunks) {
+		Tile(int[] pixels, int @Nullable [] spots) {
+			this(pixels, spots, null);
+		}
+
+		boolean same(Tile other) {
+			return java.util.Arrays.equals(this.pixels, other.pixels) && java.util.Arrays.equals(this.spots, other.spots)
+				&& java.util.Arrays.equals(this.chunks, other.chunks);
+		}
+	}
+
 	/** Recently used tiles, decompressed. Guarded by {@code this}. */
-	private final LinkedHashMap<TileKey, int[]> cache = new LinkedHashMap<>(16, 0.75F, true) {
+	private final LinkedHashMap<TileKey, Tile> cache = new LinkedHashMap<>(16, 0.75F, true) {
 		@Override
-		protected boolean removeEldestEntry(Map.Entry<TileKey, int[]> eldest) {
+		protected boolean removeEldestEntry(Map.Entry<TileKey, Tile> eldest) {
 			return this.size() > CACHED_TILES && !TileStore.this.unwritten.containsKey(eldest.getKey());
 		}
 	};
@@ -99,19 +146,15 @@ public final class TileStore {
 	 * Tiles changed since they were last written, kept until a write of exactly these pixels
 	 * succeeds. They're never evicted from the cache meanwhile. Guarded by {@code this}.
 	 */
-	private final Map<TileKey, int[]> unwritten = new HashMap<>();
-	private final Map<TileKey, MapLocations> unwrittenLocations = new HashMap<>();
-	/** Location data is prefetched off-thread; hovering never waits on the disk. Guarded by this. */
-	private final LinkedHashMap<TileKey, Optional<MapLocations>> locationCache = new LinkedHashMap<>(16, 0.75F, true) {
-		@Override
-		protected boolean removeEldestEntry(Map.Entry<TileKey, Optional<MapLocations>> eldest) {
-			return this.size() > CACHED_TILES;
-		}
-	};
-	private final Set<TileKey> locationLoads = new HashSet<>();
+	private final Map<TileKey, Tile> unwritten = new HashMap<>();
 
-	/** Level-1 overview tiles above tiles written since the last rebuild. Guarded by {@code this}. */
+	/**
+	 * Overview tiles to rebuild: level 1 above tiles written since the last rebuild, and the level-1
+	 * tiles under an overview saved before chunks were kept. Guarded by {@code this}.
+	 */
 	private final Set<TileKey> staleOverviews = new HashSet<>();
+	/** Overview tiles saved without chunks whose rebuild has been asked for. Guarded by {@code this}. */
+	private final Set<TileKey> chunksAsked = new HashSet<>();
 	private boolean rebuildScheduled;
 	/** Told about overview tiles the writer rebuilt. Called on the writer thread. */
 	private volatile Consumer<TileKey> overviewChanged = key -> {
@@ -119,61 +162,6 @@ public final class TileStore {
 
 	public TileStore(Path folder) {
 		this.folder = folder;
-		WRITER.execute(this::repairOverviews);
-	}
-
-	/**
-	 * Repair old caches and interrupted writes without touching the detailed map. Runs on the
-	 * writer, before this store's first merge. Later opens only inspect timestamps; a revision
-	 * change rebuilds every ancestor, even if an incomplete old overview has a newer timestamp.
-	 */
-	private void repairOverviews() {
-		try {
-			if (!Files.isDirectory(this.folder)) {
-				return;
-			}
-			Path revision = this.folder.resolve("overviews.version");
-			boolean rebuildAll = !Files.isRegularFile(revision) || !Files.readString(revision).equals(OVERVIEW_REVISION);
-			Set<TileKey> children = new HashSet<>();
-			try (var files = Files.list(this.folder)) {
-				for (Path file : files.filter(Files::isRegularFile).toList()) {
-					String name = file.getFileName().toString();
-					if (!name.matches("-?[0-9]+_-?[0-9]+\\.omt")) {
-						continue;
-					}
-					String[] xy = name.substring(0, name.length() - 4).split("_");
-					children.add(new TileKey(TileKey.SURFACE, Integer.parseInt(xy[0]), Integer.parseInt(xy[1])));
-				}
-			}
-			// Mark the level-1 roots of every stale chain. Rebuilding those also rebuilds all
-			// ancestors, so an interrupted higher-level write is repaired too.
-			Set<TileKey> stale = new HashSet<>();
-			for (TileKey child : children) {
-				TileKey below = child;
-				boolean needsRebuild = rebuildAll;
-				while (below.lod() < TileKey.MAX_LOD && !needsRebuild) {
-					Path parent = this.file(below.parent());
-					needsRebuild = !Files.isRegularFile(parent)
-						|| Files.getLastModifiedTime(parent).compareTo(Files.getLastModifiedTime(this.file(below))) < 0;
-					below = below.parent();
-				}
-				if (needsRebuild) {
-					stale.add(child.parent());
-				}
-			}
-			synchronized (this) {
-				this.staleOverviews.addAll(stale);
-			}
-			this.rebuildOverviews();
-			synchronized (this) {
-				if (!this.unwritten.isEmpty()) {
-					return; // A failed write must be repaired again on the next open.
-				}
-			}
-			Files.writeString(revision, OVERVIEW_REVISION);
-		} catch (IOException | RuntimeException e) {
-			Diorama.LOGGER.warn("Couldn't repair saved overview tiles in {}", this.folder, e);
-		}
 	}
 
 	public void onOverviewChanged(Consumer<TileKey> listener) {
@@ -219,35 +207,39 @@ public final class TileStore {
 		}
 	}
 
-	/** Rebuilds and writes every out-of-date overview tile, one level at a time. Writer thread. */
+	/**
+	 * Rebuilds and writes every out-of-date overview tile, one level at a time from the most
+	 * detailed up, each once, so a tile's children are rebuilt before it. Writer thread.
+	 */
 	private void rebuildOverviews() {
-		Set<TileKey> level;
+		java.util.TreeMap<Integer, Set<TileKey>> levels = new java.util.TreeMap<>();
 		synchronized (this) {
-			level = new HashSet<>(this.staleOverviews);
+			for (TileKey key : this.staleOverviews) {
+				levels.computeIfAbsent(key.lod(), lod -> new HashSet<>()).add(key);
+			}
 			this.staleOverviews.clear();
 			this.rebuildScheduled = false;
 		}
-		while (!level.isEmpty()) {
+		while (!levels.isEmpty()) {
+			Set<TileKey> level = levels.pollFirstEntry().getValue();
 			Set<TileKey> above = new HashSet<>();
 			for (TileKey key : level) {
-				int[] pixels;
-				// Read the children and publish their parent as one operation. A concurrent
-				// load or merge must never put older pixels back into this overview's cache,
-				// or its ancestors can permanently lose whole explored quadrants.
+				int[] pixels = this.shrinkChildren(key);
+				if (pixels == null) {
+					continue;
+				}
+				Tile tile = new Tile(pixels, null, this.shrinkChunks(key));
+				// Under io too, so a read loading this tile from disk can't cache the old pixels over these.
 				synchronized (this.io) {
-					pixels = this.shrinkChildren(key);
-					if (pixels == null) {
-						continue;
-					}
 					synchronized (this) {
-						this.cache.put(key, pixels);
+						this.cache.put(key, tile);
 						// Pending until written, like a bake.
-						this.unwritten.put(key, pixels);
+						this.unwritten.put(key, tile);
 					}
 				}
-				boolean saved = this.store(key, pixels);
+				boolean saved = this.store(key, tile);
 				synchronized (this) {
-					if (this.unwritten.get(key) == pixels) {
+					if (this.unwritten.get(key) == tile) {
 						if (saved) {
 							this.unwritten.remove(key);
 						} else if (!this.closed) {
@@ -263,7 +255,9 @@ public final class TileStore {
 					this.trimCache();
 				}
 			}
-			level = above;
+			if (!above.isEmpty()) {
+				levels.computeIfAbsent(above.iterator().next().lod(), lod -> new HashSet<>()).addAll(above);
+			}
 		}
 	}
 
@@ -274,121 +268,108 @@ public final class TileStore {
 	public int @Nullable [] read(TileKey key) {
 		synchronized (this.io) {
 			this.merge(key);
-			if (key.lod() == 0) {
-				this.savedLocations(key);
-			}
-			return this.saved(key);
+			Tile tile = this.saved(key);
+			return tile == null ? null : tile.pixels;
 		}
 	}
 
-	/** Cached saved coordinates, requesting a background load if this tile hasn't been read yet. */
-	public synchronized @Nullable MapLocations locations(TileKey key) {
-		MapLocations pending = this.unwrittenLocations.get(key);
-		if (pending != null) {
-			return pending;
-		}
-		Optional<MapLocations> cached = this.locationCache.get(key);
-		if (cached != null) {
-			return cached.orElse(null);
-		}
-		if (!this.closed && this.locationLoads.add(key)) {
-			WRITER.execute(() -> {
+	/**
+	 * An overview tile's chunks, from its children's as saved; null if none of them has any, or if
+	 * a child overview was saved before chunks were kept. That child is rebuilt first, and this
+	 * tile again after it, so a tile never keeps chunks with holes where its children had none.
+	 */
+	private byte @Nullable [] shrinkChunks(TileKey key) {
+		byte[][] children = new byte[4][];
+		boolean complete = true;
+		boolean anyTile = false;
+		for (int dy = 0; dy < 2; dy++) {
+			for (int dx = 0; dx < 2; dx++) {
+				TileKey child = new TileKey(key.layer(), key.tileU() * 2 + dx, key.tileV() * 2 + dy, key.lod() - 1);
+				Tile tile;
 				synchronized (this.io) {
-					this.savedLocations(key);
+					this.merge(child);
+					tile = this.saved(child);
 				}
-				synchronized (this) {
-					this.locationLoads.remove(key);
+				if (tile == null) {
+					continue;
 				}
-			});
-		}
-		return null;
-	}
-
-	/** Hold io; the returned data is never modified after publication. */
-	private @Nullable MapLocations savedLocations(TileKey key) {
-		synchronized (this) {
-			MapLocations pending = this.unwrittenLocations.get(key);
-			if (pending != null) {
-				return pending;
-			}
-			Optional<MapLocations> cached = this.locationCache.get(key);
-			if (cached != null) {
-				return cached.orElse(null);
+				anyTile = true;
+				if (child.lod() == 0) {
+					children[dy * 2 + dx] = TileChunks.fromSpots(child, tile.spots);
+				} else if (tile.chunks == null) {
+					complete = false;
+					this.askChunks(child);
+				} else {
+					children[dy * 2 + dx] = tile.chunks;
+				}
 			}
 		}
-		MapLocations loaded = null;
-		try {
-			loaded = MapLocations.read(this.locationFile(key));
-		} catch (IOException e) {
-			Diorama.LOGGER.warn("Couldn't read saved map locations for {}", key, e);
+		if (!complete) {
+			return null;
 		}
-		synchronized (this) {
-			this.locationCache.put(key, Optional.ofNullable(loaded));
+		byte[] chunks = TileChunks.shrink(key, children);
+		if (chunks == null && anyTile) {
+			// Children saved before spots were kept say nothing about chunks: all unknown, but
+			// done, so the tiles above don't wait on this one.
+			chunks = new byte[Projection.TILE_PIXELS * Projection.TILE_PIXELS];
+			java.util.Arrays.fill(chunks, TileChunks.NONE);
 		}
-		return loaded;
+		return chunks;
 	}
 
-	private void mergeLocations(TileKey key, List<TileImage> images) {
-		if (images.stream().noneMatch(image -> image.locations() != null)) {
+	/**
+	 * The {@link TileChunks} of a saved tile, or null if there are none. Like {@link #read}. An
+	 * overview tile saved before they were kept has none yet: this asks for it to be rebuilt, once,
+	 * from the level-1 tiles under it up.
+	 */
+	public byte @Nullable [] chunks(TileKey key) {
+		Tile tile;
+		synchronized (this.io) {
+			this.merge(key);
+			tile = this.saved(key);
+		}
+		if (tile == null) {
+			return null;
+		}
+		if (key.lod() == 0) {
+			return TileChunks.fromSpots(key, tile.spots);
+		}
+		if (tile.chunks == null) {
+			this.askChunks(key);
+		}
+		return tile.chunks;
+	}
+
+	/** Rebuilds an overview tile saved without chunks, and every level-1 tile under it, so each gets them. */
+	private synchronized void askChunks(TileKey key) {
+		if (this.closed || !this.chunksAsked.add(key)) {
 			return;
 		}
-		MapLocations before = this.savedLocations(key);
-		MapLocations merged = before;
-		for (TileImage image : images) {
-			if (image.locations() != null) {
-				merged = merged == null ? image.locations() : merged.merge(image.locations());
+		int span = 1 << (key.lod() - 1);
+		for (int du = 0; du < span; du++) {
+			for (int dv = 0; dv < span; dv++) {
+				this.staleOverviews.add(new TileKey(key.layer(), key.tileU() * span + du, key.tileV() * span + dv, 1));
 			}
 		}
-		if (merged == before) {
-			return;
-		}
-		synchronized (this) {
-			this.locationCache.put(key, Optional.of(merged));
-			if (this.unwrittenLocations.put(key, merged) == null) {
-				WRITER.schedule(() -> this.writeLocations(key), WRITE_DELAY_SECONDS, TimeUnit.SECONDS);
-			}
+		if (!this.rebuildScheduled) {
+			this.rebuildScheduled = true;
+			WRITER.schedule(this::rebuildOverviews, OVERVIEW_DELAY_SECONDS, TimeUnit.SECONDS);
 		}
 	}
 
-	private Path locationFile(TileKey key) {
-		return this.folder.resolve(key.tileU() + "_" + key.tileV() + ".omp");
-	}
-
-	private boolean storeLocations(TileKey key, MapLocations locations) {
-		try {
-			locations.write(this.locationFile(key));
-			return true;
-		} catch (IOException | RuntimeException e) {
-			Diorama.LOGGER.error("Couldn't save map locations for {}", key, e);
-			return false;
+	/** The saved {@link TileSpots} of a level-0 tile, or null if there are none. Like {@link #read}. */
+	public int @Nullable [] spots(TileKey key) {
+		synchronized (this.io) {
+			this.merge(key);
+			Tile tile = this.saved(key);
+			return tile == null ? null : tile.spots;
 		}
 	}
 
-	private void writeLocations(TileKey key) {
-		if (this.closed) {
-			return;
-		}
-		MapLocations locations;
+	/** The tile in memory, else on disk, leaving out bakes not merged yet. Hold {@link #io}. */
+	private @Nullable Tile saved(TileKey key) {
 		synchronized (this) {
-			locations = this.unwrittenLocations.get(key);
-		}
-		if (locations == null) {
-			return;
-		}
-		boolean saved = this.storeLocations(key, locations);
-		synchronized (this) {
-			if (saved && this.unwrittenLocations.get(key) == locations) {
-				this.unwrittenLocations.remove(key);
-			} else {
-				WRITER.schedule(() -> this.writeLocations(key), saved ? WRITE_DELAY_SECONDS : RETRY_DELAY_SECONDS, TimeUnit.SECONDS);
-			}
-		}
-	}
-
-	/** The tile's pixels in memory, else on disk, leaving out bakes not merged yet. Hold {@link #io}. */
-	private int @Nullable [] saved(TileKey key) {
-		synchronized (this) {
-			int[] pending = this.unwritten.get(key);
+			Tile pending = this.unwritten.get(key);
 			if (pending != null) {
 				return pending;
 			}
@@ -396,11 +377,11 @@ public final class TileStore {
 				return this.cache.get(key);
 			}
 		}
-		int[] pixels = this.load(key);
+		Tile tile = this.load(key);
 		synchronized (this) {
-			this.cache.put(key, pixels);
+			this.cache.put(key, tile);
 		}
-		return pixels;
+		return tile;
 	}
 
 	/**
@@ -441,14 +422,14 @@ public final class TileStore {
 				images = List.copyOf(queue);
 			}
 			int size = Projection.TILE_PIXELS;
-			int[] saved = this.saved(key);
+			Tile saved = this.saved(key);
 			boolean changed = false;
 			for (TileImage image : images) {
 				int[] pixels;
 				if (image.isFull()) {
 					pixels = image.mips()[0].clone();
 				} else {
-					pixels = saved == null ? new int[size * size] : saved.clone();
+					pixels = saved == null ? new int[size * size] : saved.pixels.clone();
 					for (TileImage.Patch patch : image.patches()) {
 						int[] block = patch.mips()[0];
 						int edge = TileImage.BLOCK;
@@ -457,15 +438,15 @@ public final class TileStore {
 						}
 					}
 				}
-				if (saved != null ? java.util.Arrays.equals(saved, pixels) : nothingKnown(pixels)) {
+				Tile merged = new Tile(pixels, mergeSpots(saved == null ? null : saved.spots, image));
+				if (saved != null ? saved.same(merged) : nothingKnown(pixels)) {
 					count(true);
 					continue;
 				}
 				count(false);
-				saved = pixels;
+				saved = merged;
 				changed = true;
 			}
-			this.mergeLocations(key, images);
 			synchronized (this) {
 				// Bakes handed over meanwhile stay queued; their own merge comes next.
 				ArrayDeque<TileImage> queue = this.handedOver.get(key);
@@ -487,6 +468,151 @@ public final class TileStore {
 		}
 	}
 
+	/** The spots after a bake: its own where it has them, the saved ones elsewhere. */
+	private static int @Nullable [] mergeSpots(int @Nullable [] saved, TileImage image) {
+		int[] fresh = image.spots();
+		if (fresh == null) {
+			return saved;
+		}
+		if (image.isFull()) {
+			return fresh.clone();
+		}
+		int[] spots = saved == null ? new int[fresh.length] : saved.clone();
+		for (TileImage.Patch patch : image.patches()) {
+			for (int row = patch.blockY() * TileImage.BLOCK; row < (patch.blockY() + 1) * TileImage.BLOCK; row++) {
+				int i = row * TileSpots.COLUMNS + TileSpots.patchColumn(patch);
+				System.arraycopy(fresh, i, spots, i, TileSpots.PATCH_COLUMNS);
+			}
+		}
+		return spots;
+	}
+
+	/** For tests: makes an overview tile look like one saved before chunks were kept, on disk too. */
+	public void forgetChunks(TileKey key) {
+		Tile old;
+		synchronized (this.io) {
+			this.merge(key);
+			Tile tile = this.saved(key);
+			if (tile == null || key.lod() == 0) {
+				return;
+			}
+			old = new Tile(tile.pixels, null, null);
+			synchronized (this) {
+				this.cache.put(key, old);
+				this.chunksAsked.remove(key);
+			}
+		}
+		this.store(key, old);
+	}
+
+	/** For tests: makes a level-0 tile look like one saved before spots were kept, on disk too. */
+	public void forgetSpots(TileKey key) {
+		Tile old;
+		synchronized (this.io) {
+			this.merge(key);
+			Tile tile = this.saved(key);
+			if (tile == null || key.lod() != 0) {
+				return;
+			}
+			old = new Tile(tile.pixels, null, null);
+			synchronized (this) {
+				this.cache.put(key, old);
+				// A write still waiting would put the spots back.
+				this.unwritten.replace(key, old);
+			}
+		}
+		this.store(key, old);
+	}
+
+	/**
+	 * Merges every bake handed over so far and rebuilds the overview tiles above them, and any
+	 * left out of date when the game last quit, so reads at every level show everything mapped up
+	 * to now. Waits for the writer; not on the render thread.
+	 */
+	public void catchUp() throws InterruptedException {
+		Future<?> done = WRITER.submit(() -> {
+			Set<TileKey> handed;
+			synchronized (this) {
+				handed = new HashSet<>(this.handedOver.keySet());
+			}
+			for (TileKey key : handed) {
+				this.merge(key);
+			}
+			synchronized (this) {
+				for (TileKey key : this.unwritten.keySet()) {
+					if (key.lod() < TileKey.MAX_LOD) {
+						this.staleOverviews.add(key.parent());
+					}
+				}
+			}
+			this.findStaleOverviews();
+			this.rebuildOverviews();
+		});
+		try {
+			done.get();
+		} catch (ExecutionException e) {
+			Diorama.LOGGER.error("Couldn't bring the saved map up to date", e);
+		}
+	}
+
+	/**
+	 * Marks overview tiles missing or older on disk than a tile under them. A game that quit
+	 * between saving a tile and rebuilding the overviews above it, a couple of seconds later, leaves
+	 * them so, and nothing else would rebuild them. Writer thread.
+	 */
+	private void findStaleOverviews() {
+		for (int lod = 0; lod < TileKey.MAX_LOD; lod++) {
+			for (TileKey key : this.saved(lod)) {
+				Path child = this.file(key);
+				Path parent = this.file(key.parent());
+				try {
+					if (Files.isRegularFile(child) && (!Files.isRegularFile(parent)
+						|| Files.getLastModifiedTime(parent).compareTo(Files.getLastModifiedTime(child)) < 0)) {
+						synchronized (this) {
+							this.staleOverviews.add(key.parent());
+						}
+					}
+				} catch (IOException e) {
+					// Can't tell: leave it as it is.
+				}
+			}
+		}
+	}
+
+	/** Every saved tile at an overview level, 0 for the detailed tiles, on disk or about to be. */
+	public Set<TileKey> saved(int lod) {
+		Set<TileKey> keys = new HashSet<>();
+		Path dir = lod == 0 ? this.folder : this.folder.resolve("lod" + lod);
+		if (Files.isDirectory(dir)) {
+			try (java.util.stream.Stream<Path> files = Files.list(dir)) {
+				files.forEach(file -> {
+					String name = file.getFileName().toString();
+					int split = name.indexOf('_');
+					if (!name.endsWith(".omt") || split < 0) {
+						return;
+					}
+					try {
+						int u = Integer.parseInt(name.substring(0, split));
+						int v = Integer.parseInt(name.substring(split + 1, name.length() - 4));
+						keys.add(new TileKey(TileKey.SURFACE, u, v, lod));
+					} catch (NumberFormatException e) {
+						// Not a tile.
+					}
+				});
+			} catch (IOException e) {
+				Diorama.LOGGER.warn("Couldn't list saved tiles in {}", dir, e);
+			}
+		}
+		synchronized (this) {
+			for (TileKey key : this.unwritten.keySet()) {
+				if (key.lod() == lod) {
+					keys.add(key);
+				}
+			}
+		}
+		return keys;
+	}
+
 	/** Writes everything pending and waits until it's on disk. Call when leaving the world. */
 	public void close() {
 		if (this.closed) {
@@ -501,13 +627,11 @@ public final class TileStore {
 			for (TileKey key : handed) {
 				this.merge(key);
 			}
-			Map<TileKey, int[]> pending;
-			Map<TileKey, MapLocations> pendingLocations;
+			Map<TileKey, Tile> pending;
 			synchronized (this) {
 				pending = new HashMap<>(this.unwritten);
-				pendingLocations = new HashMap<>(this.unwrittenLocations);
 			}
-			for (Map.Entry<TileKey, int[]> entry : pending.entrySet()) {
+			for (Map.Entry<TileKey, Tile> entry : pending.entrySet()) {
 				// Nothing to retry with once the world is closed; store() has logged the failure.
 				if (this.store(entry.getKey(), entry.getValue()) && entry.getKey().lod() == 0) {
 					synchronized (this) {
@@ -515,14 +639,9 @@ public final class TileStore {
 					}
 				}
 			}
-			for (var entry : pendingLocations.entrySet()) {
-				this.storeLocations(entry.getKey(), entry.getValue());
-			}
 			this.rebuildOverviews();
 			synchronized (this) {
 				this.unwritten.clear();
-				this.unwrittenLocations.clear();
-				this.locationCache.clear();
 				this.cache.clear();
 			}
 		});
@@ -540,19 +659,19 @@ public final class TileStore {
 		if (this.closed) {
 			return;
 		}
-		int[] pixels;
+		Tile tile;
 		synchronized (this) {
-			pixels = this.unwritten.get(key);
+			tile = this.unwritten.get(key);
 		}
-		if (pixels == null) {
+		if (tile == null) {
 			return;
 		}
-		boolean saved = this.store(key, pixels);
+		boolean saved = this.store(key, tile);
 		if (saved && key.lod() == 0) {
 			this.overviewsStale(key);
 		}
 		synchronized (this) {
-			if (this.unwritten.get(key) != pixels) {
+			if (this.unwritten.get(key) != tile) {
 				// A newer bake arrived while this one was being written: write that too.
 				WRITER.schedule(() -> this.write(key), WRITE_DELAY_SECONDS, TimeUnit.SECONDS);
 			} else if (saved) {
@@ -603,18 +722,8 @@ public final class TileStore {
 		return dir.resolve(key.tileU() + "_" + key.tileV() + ".omt");
 	}
 
-	private int @Nullable [] load(TileKey key) {
+	private @Nullable Tile load(TileKey key) {
 		Path file = this.file(key);
-		try {
-			return readFile(file);
-		} catch (IOException e) {
-			Diorama.LOGGER.warn("Couldn't read saved tile {}", file, e);
-			return null;
-		}
-	}
-
-	/** Shared with Realm migration, which must merge detailed pixels rather than overwrite tiles. */
-	static int @Nullable [] readFile(Path file) throws IOException {
 		if (!Files.isRegularFile(file)) {
 			return null;
 		}
@@ -623,13 +732,32 @@ public final class TileStore {
 				return null;
 			}
 			int size = Projection.TILE_PIXELS;
-			byte[] bytes = new InflaterInputStream(in).readNBytes(size * size * 4);
+			InflaterInputStream inflated = new InflaterInputStream(in);
+			byte[] bytes = inflated.readNBytes(size * size * 4);
 			if (bytes.length != size * size * 4) {
 				return null;
 			}
 			int[] pixels = new int[size * size];
 			ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(pixels);
-			return pixels;
+			// Tiles saved before spots, and overview tiles saved before chunks, end here.
+			if (key.lod() > 0) {
+				byte[] more = inflated.readNBytes(4 + size * size);
+				if (more.length == 4 + size * size && ByteBuffer.wrap(more).order(ByteOrder.LITTLE_ENDIAN).getInt() == CHUNKS_MAGIC) {
+					return new Tile(pixels, null, java.util.Arrays.copyOfRange(more, 4, more.length));
+				}
+				return new Tile(pixels, null);
+			}
+			int[] spots = null;
+			byte[] more = inflated.readNBytes(4 + TileSpots.COLUMNS * TileSpots.ROWS * 4);
+			ByteBuffer rest = ByteBuffer.wrap(more).order(ByteOrder.LITTLE_ENDIAN);
+			if (more.length == 4 + TileSpots.COLUMNS * TileSpots.ROWS * 4 && rest.getInt() == SPOTS_MAGIC) {
+				spots = new int[TileSpots.COLUMNS * TileSpots.ROWS];
+				rest.asIntBuffer().get(spots);
+			}
+			return new Tile(pixels, spots);
+		} catch (IOException e) {
+			Diorama.LOGGER.warn("Couldn't read saved tile {}", file, e);
+			return null;
 		}
 	}
 
@@ -637,31 +765,40 @@ public final class TileStore {
 	 * Writes to a temporary file and moves it over the old one, so a crash can't leave half a tile.
 	 * Returns whether it worked.
 	 */
-	private boolean store(TileKey key, int[] pixels) {
+	private boolean store(TileKey key, Tile tile) {
 		Path file = this.file(key);
+		int[] pixels = tile.pixels;
+		int[] spots = tile.spots;
+		byte[] chunks = tile.chunks;
 		try {
-			writeFile(file, pixels);
+			Files.createDirectories(file.getParent());
+			int extra = spots != null ? 4 + spots.length * 4 : chunks != null ? 4 + chunks.length : 0;
+			ByteBuffer buffer = ByteBuffer.allocate(pixels.length * 4 + extra).order(ByteOrder.LITTLE_ENDIAN);
+			buffer.asIntBuffer().put(pixels);
+			if (spots != null) {
+				buffer.position(pixels.length * 4);
+				buffer.putInt(SPOTS_MAGIC);
+				buffer.asIntBuffer().put(spots);
+			} else if (chunks != null) {
+				buffer.position(pixels.length * 4);
+				buffer.putInt(CHUNKS_MAGIC);
+				buffer.put(chunks);
+			}
+			ByteArrayOutputStream bytes = new ByteArrayOutputStream(pixels.length);
+			try (DataOutputStream data = new DataOutputStream(bytes)) {
+				data.writeInt(MAGIC);
+				data.writeInt(Projection.TILE_PIXELS);
+				try (OutputStream deflate = new DeflaterOutputStream(data)) {
+					deflate.write(buffer.array());
+				}
+			}
+			Path temp = file.resolveSibling(file.getFileName() + ".tmp");
+			Files.write(temp, bytes.toByteArray());
+			Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 			return true;
 		} catch (IOException | RuntimeException e) {
 			Diorama.LOGGER.error("Couldn't save tile {}", file, e);
 			return false;
 		}
-	}
-
-	static void writeFile(Path file, int[] pixels) throws IOException {
-		Files.createDirectories(file.getParent());
-		ByteBuffer buffer = ByteBuffer.allocate(pixels.length * 4).order(ByteOrder.LITTLE_ENDIAN);
-		buffer.asIntBuffer().put(pixels);
-		ByteArrayOutputStream bytes = new ByteArrayOutputStream(pixels.length);
-		try (DataOutputStream data = new DataOutputStream(bytes)) {
-			data.writeInt(MAGIC);
-			data.writeInt(Projection.TILE_PIXELS);
-			try (OutputStream deflate = new DeflaterOutputStream(data)) {
-				deflate.write(buffer.array());
-			}
-		}
-		Path temp = file.resolveSibling(file.getFileName() + ".tmp");
-		Files.write(temp, bytes.toByteArray());
-		Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 	}
 }
