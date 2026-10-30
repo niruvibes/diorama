@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -37,6 +38,12 @@ import org.jspecify.annotations.Nullable;
  * the map is open. Esc drops what's half drawn, then leaves draw mode.
  */
 public final class DrawMode {
+	private final Supplier<String> dimension;
+
+	public DrawMode(Supplier<String> dimension) {
+		this.dimension = dimension;
+	}
+
 	public enum Tool {
 		PEN, LINE, AREA, NOTE, ERASE, MEASURE
 	}
@@ -511,9 +518,8 @@ public final class DrawMode {
 		}
 	}
 
-	private static @Nullable String currentDimension() {
-		Minecraft mc = Minecraft.getInstance();
-		return mc.level == null ? null : mc.level.dimension().identifier().toString();
+	private String currentDimension() {
+		return this.dimension.get();
 	}
 
 	private void finish(Drawing drawing) {

@@ -53,6 +53,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 import org.jspecify.annotations.Nullable;
 import com.mojang.blaze3d.platform.InputConstants;
 
@@ -124,7 +125,7 @@ public final class MapScreen extends Screen {
 	private Button settingsButton;
 	/** Turns draw mode on and off; it sits above the zoom buttons. */
 	private Button drawButton;
-	private final DrawMode draw = new DrawMode();
+	private final DrawMode draw = new DrawMode(this::dimension);
 	/** The tabs' left edges and widths as drawn last frame, and where the status text starts. */
 	private final int[] tabX = new int[2];
 	private final int[] tabWidth = new int[2];
@@ -221,7 +222,11 @@ public final class MapScreen extends Screen {
 
 	/** Puts the zoom buttons beside the gauge on the cave map, in the corner otherwise. */
 	private void placeControls() {
+		// The drawing toolbar starts at the left below the tabs; keep the selector beside it.
+		int dimensionX = this.draw.active() ? 32 : 6;
 		for (Button button : this.dimensionButtons) {
+			button.setX(dimensionX);
+			dimensionX += button.getWidth() + 2;
 			button.active = !button.getMessage().getString().equals(Waypoints.dimensionName(this.dimension()).getString()) && Maps.get() != null;
 		}
 		boolean caves = this.layer != TileKey.SURFACE;
@@ -932,7 +937,7 @@ public final class MapScreen extends Screen {
 	 * zoom buttons: pins inside the view stay where they are.
 	 */
 	private List<WaypointOverlay.Pin> layoutPins(MapViewport.View view, List<Waypoint> waypoints) {
-		int top = BAR + 1;
+		int top = BAR * 2 + 6;
 		int bottom = this.height - BOTTOM_BAR - 1;
 		int right = this.width - (this.layer != TileKey.SURFACE ? 60 : 0);
 		// The same map under a smaller view: points land where they do in the full one.
@@ -1187,7 +1192,7 @@ public final class MapScreen extends Screen {
 	private @Nullable Component biomeAt(BlockPos pos) {
 		ClientLevel level = this.minecraft.level;
 		if (!this.browser.live() || level == null || level.getChunkSource().getChunk(pos.getX() >> 4, pos.getZ() >> 4,
-			net.minecraft.world.level.chunk.status.ChunkStatus.FULL, false) == null) {
+			ChunkStatus.FULL, false) == null) {
 			return null;
 		}
 		return level.getBiome(pos).unwrapKey()
@@ -1256,6 +1261,9 @@ public final class MapScreen extends Screen {
 			return;
 		}
 		this.cameras.put(this.dimension(), new Camera(this.centerU, this.centerV, this.zoom, this.layer, this.following));
+		if (this.draw.active()) {
+			this.draw.stop();
+		}
 		this.browser.select(dimension);
 		this.menu = null;
 		this.spot = null;
@@ -1264,9 +1272,6 @@ public final class MapScreen extends Screen {
 		this.fitRequest = null;
 		this.lastView = null;
 		this.gauge.cancel();
-		if (this.draw.active()) {
-			this.draw.toggle();
-		}
 		Camera camera = this.cameras.get(dimension);
 		this.centerU = camera == null ? 0 : camera.u();
 		this.centerV = camera == null ? 0 : camera.v();

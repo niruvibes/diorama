@@ -14,6 +14,8 @@ import dev.diorama.bake.TileImage;
 import dev.diorama.bake.TileKey;
 import dev.diorama.bake.TileSpots;
 import dev.diorama.data.TileStore;
+import dev.diorama.drawing.Drawing;
+import dev.diorama.drawing.DrawingStore;
 import dev.diorama.waypoint.Waypoint;
 import dev.diorama.waypoint.WaypointStore;
 import java.nio.file.Files;
@@ -102,7 +104,9 @@ final class DimensionBrowsingTest {
 			}
 			try {
 				var image = ImageIO.read(made.get(0).toFile());
-				if ((image.getRGB(image.getWidth() / 2, image.getHeight() / 2) & 0xFFFFFF) != 0x20C040) {
+				int pixel = image.getRGB(image.getWidth() / 2, image.getHeight() / 2);
+				// The fog's grain changes even fully explored pixels by a few colour levels.
+				if (Math.abs((pixel >> 16 & 255) - 32) > 8 || Math.abs((pixel >> 8 & 255) - 192) > 8 || Math.abs((pixel & 255) - 64) > 8) {
 					throw new AssertionError("The export isn't the green End fixture");
 				}
 			} catch (java.io.IOException e) {
@@ -118,6 +122,42 @@ final class DimensionBrowsingTest {
 				throw new AssertionError("Returning to the live dimension replaced its map");
 			}
 			context.takeScreenshot("dimension-browser-overworld");
+			click(context, mc -> centre(((MapScreen) mc.gui.screen()).drawButton()), InputConstants.MOUSE_BUTTON_LEFT);
+			context.runOnClient(mc -> {
+				var screen = (MapScreen) mc.gui.screen();
+				Button pen = screen.drawMode().toolButtons().get(0);
+				for (var child : screen.children()) {
+					if (child instanceof Button b && List.of("Overworld", "Nether", "End").contains(b.getMessage().getString())
+						&& b.getX() < pen.getX() + pen.getWidth()) {
+						throw new AssertionError("The dimension selector overlaps the drawing toolbar");
+					}
+				}
+			});
+			clickDimension(context, "Nether", NETHER, live);
+			if (context.computeOnClient(mc -> ((MapScreen) mc.gui.screen()).drawMode().active())) {
+				throw new AssertionError("Switching dimensions left a drawing gesture active");
+			}
+			click(context, mc -> centre(((MapScreen) mc.gui.screen()).drawButton()), InputConstants.MOUSE_BUTTON_LEFT);
+			click(context, mc -> centre(((MapScreen) mc.gui.screen()).drawMode().toolButtons().get(3)), InputConstants.MOUSE_BUTTON_LEFT);
+			click(context, mc -> new double[] {mc.gui.screen().width / 2.0, mc.gui.screen().height / 2.0}, InputConstants.MOUSE_BUTTON_LEFT);
+			context.getInput().typeChars("Nether note");
+			context.getInput().pressKey(InputConstants.KEY_RETURN);
+			context.waitTicks(3);
+			// Keep a second half-typed note by switching dimensions, then come back.
+			click(context, mc -> new double[] {mc.gui.screen().width / 2.0 + 20, mc.gui.screen().height / 2.0 + 20}, InputConstants.MOUSE_BUTTON_LEFT);
+			context.getInput().typeChars("Kept on switch");
+			clickDimension(context, "End", END, live);
+			if (!context.computeOnClient(mc -> DrawingStore.get().in(NETHER).stream().filter(d -> d.kind == Drawing.Kind.NOTE && nether.equals(d.map)).count() == 2
+				&& DrawingStore.get().in(OVERWORLD).stream().noneMatch(d -> d.text.equals("Nether note") || d.text.equals("Kept on switch")))) {
+				throw new AssertionError("Notes made in the archived Nether were saved in another dimension");
+			}
+			clickDimension(context, "Nether", NETHER, live);
+			context.getInput().resizeWindow(960, 720);
+			context.waitTicks(5);
+			context.takeScreenshot("dimension-browser-small");
+			clickDimension(context, "Overworld", OVERWORLD, live);
+			context.getInput().resizeWindow(1600, 900);
+			context.waitTicks(4);
 			// An unvisited dimension stays empty; no live Overworld tiles are baked into its folder.
 			String empty = context.computeOnClient(mc -> maps.create(END, "Browser Empty"));
 			clickDimension(context, "End", END, live);
